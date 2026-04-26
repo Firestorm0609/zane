@@ -40,7 +40,15 @@ def schedule_lookbacks(signal_id: int, mint: str) -> None:
     db_write(_w)
 
 
-async def process_due_lookbacks() -> None:
+async def process_due_lookbacks() -> bool:
+    """Process up to 50 due lookbacks.
+
+    Returns True if the batch was full (caller should loop immediately to
+    drain remaining backlog rather than waiting 60 s).
+    """
+    # Deferred import to avoid circular dependency at module level.
+    from .trading import maybe_auto_blacklist_creator
+
     ts = now_ts()
     with closing(db_conn()) as conn:
         due = conn.execute("""
@@ -52,7 +60,14 @@ async def process_due_lookbacks() -> None:
             LIMIT 50
         """, (ts,)).fetchall()
     if not due:
-        return
+        return False
+
+    batch_full = len(due) == 50
+    if batch_full:
+        log.warning(
+            "Lookback backlog: processed a full batch of 50 rows — "
+            "more may be pending; draining immediately."
+        )
 
     loop = asyncio.get_running_loop()
 
@@ -97,16 +112,27 @@ async def process_due_lookbacks() -> None:
                             "WHERE mint=? AND outcome IS NULL",
                             (_out, mint))
                 await loop.run_in_executor(None, db_write, _update)
+
+                # Trigger auto-blacklist NOW — outcome is committed in the DB
+                # so maybe_auto_blacklist_creator sees real labelled data.
+                await loop.run_in_executor(
+                    None, maybe_auto_blacklist_creator, row["mint"])
+
                 log.info("LOOKBACK %-5s | %s | %-5s | %+.1f%%",
                          row["window_label"], row["mint"][:8], outcome, pct)
             except Exception as e:
                 log.error("lookback row %s failed: %s", row["id"], e)
 
+    return batch_full
+
 
 async def lookback_loop() -> None:
     while True:
         try:
-            await process_due_lookbacks()
+            # Drain backlog: if the batch was full, loop immediately
+            # instead of waiting 60 s for the next tick.
+            while await process_due_lookbacks():
+                await asyncio.sleep(0)   # yield to event loop between bursts
         except Exception as e:
             log.error("lookback_loop: %s", e)
         await asyncio.sleep(60)
@@ -126,3 +152,4 @@ async def training_loop(engine: ScoringEngine) -> None:
         except Exception as e:
             log.error("training_loop: %s", e)
         await asyncio.sleep(RETRAIN_EVERY_SEC)
+

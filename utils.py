@@ -95,12 +95,44 @@ def score_emoji(s) -> str:
 REC_EMOJI = {"PASS": "⛔", "WATCH": "👀", "BUY": "🚀"}
 
 
-def validate_url(url: Optional[str]) -> Optional[str]:
+# Domains permitted for social link fields (twitter, telegram).
+# Websites get the looser check since they can be any domain.
+_SOCIAL_ALLOWED_DOMAINS = {
+    "twitter.com", "www.twitter.com",
+    "x.com", "www.x.com",
+    "t.me", "telegram.me",
+    "discord.com", "discord.gg",
+    "instagram.com", "www.instagram.com",
+    "youtube.com", "www.youtube.com",
+    "tiktok.com", "www.tiktok.com",
+    "reddit.com", "www.reddit.com",
+    "medium.com",
+}
+
+
+def validate_url(url: Optional[str], *, social: bool = False) -> Optional[str]:
+    """Return the URL if valid, else None.
+
+    When ``social=True``, only URLs whose hostname is in the social-platform
+    allowlist are accepted.  This prevents malicious token creators from
+    injecting arbitrary phishing links into the twitter/telegram fields.
+    """
     if not url:
         return None
     url = str(url).strip()
-    return url if re.match(r"^https?://[^\s<>]+$", url, re.I) else None
+    if not re.match(r"^https?://[^\s<>]+$", url, re.I):
+        return None
+    if social:
+        # Extract hostname for allowlist check
+        m = re.match(r"^https?://([^/?#\s]+)", url, re.I)
+        if not m:
+            return None
+        host = m.group(1).lower()
+        if host not in _SOCIAL_ALLOWED_DOMAINS:
+            return None
+    return url
 
 
 def strip_md2(text: str) -> str:
     return re.sub(r"\\([_*\[\]()~`>#+\-=|{}.!\\])", r"\1", text)
+

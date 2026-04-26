@@ -1,4 +1,5 @@
 """Telegram message building and sending."""
+import asyncio
 import logging
 from contextlib import closing
 from typing import Optional
@@ -33,8 +34,8 @@ def build_message(coin: dict, result: dict) -> str:
     mode    = result.get("mode", "") or ""
     red_f   = result.get("red_flags", []) or []
 
-    tw_url = validate_url(coin.get("twitter"))
-    tg_url = validate_url(coin.get("telegram"))
+    tw_url = validate_url(coin.get("twitter"), social=True)
+    tg_url = validate_url(coin.get("telegram"), social=True)
     wb_url = validate_url(coin.get("website"))
     socials_parts = []
     if tw_url: socials_parts.append("🐦 Twitter")
@@ -88,8 +89,8 @@ def build_keyboard(coin: dict) -> Optional[InlineKeyboardMarkup]:
     rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton("🔗 Open on Pump.fun", url=f"{PUMP_FRONT}/{mint}")]
     ]
-    tw = validate_url(coin.get("twitter"))
-    tg = validate_url(coin.get("telegram"))
+    tw = validate_url(coin.get("twitter"), social=True)
+    tg = validate_url(coin.get("telegram"), social=True)
     wb = validate_url(coin.get("website"))
     if tw: rows.append([InlineKeyboardButton("🐦 Twitter",  url=tw)])
     if tg: rows.append([InlineKeyboardButton("✈️ Telegram", url=tg)])
@@ -142,7 +143,13 @@ async def send_alert(bot: Bot, coin: dict, result: dict, state: BotState) -> Non
         return
     kb = build_keyboard(coin)
 
-    for chat_id, threshold in list(state.alerts.items()):
+    # Snapshot the dict before iteration.  Callback handlers can mutate
+    # state.alerts between awaits; the snapshot prevents mid-loop surprises.
+    # Chats to disable are collected and removed AFTER the loop completes.
+    alerts_snapshot = list(state.alerts.items())
+    stale_chats: list[int] = []
+
+    for chat_id, threshold in alerts_snapshot:
         if score < threshold:
             continue
         try:
@@ -165,7 +172,6 @@ async def send_alert(bot: Bot, coin: dict, result: dict, state: BotState) -> Non
         except RetryAfter as e:
             log.warning("Rate limited on chat %s — sleeping %.0fs",
                         chat_id, e.retry_after)
-            import asyncio
             await asyncio.sleep(e.retry_after)
             try:
                 await _send_with_fallback(bot, chat_id, text, kb)
@@ -176,10 +182,15 @@ async def send_alert(bot: Bot, coin: dict, result: dict, state: BotState) -> Non
             err_str = str(e).lower()
             if any(kw in err_str for kw in
                    ("blocked", "kicked", "chat not found", "deactivated")):
-                state.alerts.pop(chat_id, None)
-                try:
-                    upsert_chat(chat_id, alerts_enabled=0)
-                except Exception:
-                    pass
-                log.warning("Removed unreachable chat %s", chat_id)
+                stale_chats.append(chat_id)
+                log.warning("Marking chat %s as unreachable", chat_id)
+
+    # Remove stale chats after the loop — not during it
+    for chat_id in stale_chats:
+        state.alerts.pop(chat_id, None)
+        try:
+            upsert_chat(chat_id, alerts_enabled=0)
+        except Exception:
+            pass
+        log.warning("Removed unreachable chat %s from alerts", chat_id)
 

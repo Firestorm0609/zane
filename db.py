@@ -194,26 +194,23 @@ def upsert_chat(chat_id: int, alerts_enabled=None, threshold=None,
 
     def _write():
         with closing(db_conn()) as conn, conn:
-            ex = conn.execute(
-                "SELECT * FROM chat_settings WHERE chat_id=?", (chat_id,)
-            ).fetchone()
-            if ex is None:
-                conn.execute(
-                    "INSERT INTO chat_settings(chat_id,alerts_enabled,threshold,"
-                    "paper_reports_enabled) VALUES(?,?,?,?)",
-                    (chat_id,
-                     alerts_enabled if alerts_enabled is not None else 0,
-                     threshold if threshold is not None else DEFAULT_THRESHOLD,
-                     paper_reports_enabled if paper_reports_enabled is not None else 0))
-            else:
-                ae = int(ex["alerts_enabled"]) if alerts_enabled is None else int(alerts_enabled)
-                th = int(ex["threshold"])      if threshold      is None else int(threshold)
-                pe = (int(ex["paper_reports_enabled"])
-                      if paper_reports_enabled is None else int(paper_reports_enabled))
-                conn.execute(
-                    "UPDATE chat_settings SET alerts_enabled=?,threshold=?,"
-                    "paper_reports_enabled=? WHERE chat_id=?",
-                    (ae, th, pe, chat_id))
+            conn.execute("""
+                INSERT INTO chat_settings(chat_id, alerts_enabled, threshold, paper_reports_enabled)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    alerts_enabled        = COALESCE(?, alerts_enabled),
+                    threshold             = COALESCE(?, threshold),
+                    paper_reports_enabled = COALESCE(?, paper_reports_enabled)
+            """, (
+                chat_id,
+                alerts_enabled if alerts_enabled is not None else 0,
+                threshold if threshold is not None else DEFAULT_THRESHOLD,
+                paper_reports_enabled if paper_reports_enabled is not None else 0,
+                # COALESCE args — None keeps the existing column value
+                alerts_enabled,
+                threshold,
+                paper_reports_enabled,
+            ))
     db_write(_write)
 
 
@@ -231,3 +228,4 @@ def get_state(key: str, default: str = "") -> str:
     with closing(db_conn()) as conn:
         r = conn.execute("SELECT value FROM bot_state WHERE key=?", (key,)).fetchone()
         return r["value"] if r else default
+

@@ -16,7 +16,6 @@ from .market import MarketContext
 from .processor import process_coin
 from .scoring import ScoringEngine
 from .state import BotState
-from .storage import save_dead_letter
 from .utils import mdbold, mdcode
 
 log = logging.getLogger(__name__)
@@ -42,9 +41,12 @@ async def _enrich_and_process(
         async with aiohttp.ClientSession() as session:
             coin, enrich_err = await enrich_from_pumpfun(coin, session)
             if enrich_err:
-                log.debug("enrich %s: %s — using partial data",
+                # Log but proceed with partial data; do NOT save a dead letter
+                # here because process_coin will run immediately below.
+                # Saving a dead letter AND processing causes duplicate alerts
+                # when the retry loop re-processes the same mint after TTL expiry.
+                log.debug("enrich %s: %s â€” using partial data",
                           (coin.get("mint", "?") or "?")[:8], enrich_err)
-                save_dead_letter(coin.get("mint", ""), coin, enrich_err)
 
             coin = await enrich_with_rpc(coin, session)
 
@@ -124,10 +126,10 @@ async def stream(
                         name = data.get("name") or data.get("symbol") or mint[:8]
                         log.info("GRADUATION | %s | %s", mint[:8], name)
                         grad_text = (
-                            f"🎓 {mdbold('Raydium Graduation!')}\n"
+                            f"ðŸŽ“ {mdbold('Raydium Graduation!')}\n"
                             f"{mdbold(name)} has graduated from pump\\.fun to Raydium\\!\n"
-                            f"🪙 {mdcode(mint)}\n"
-                            f"🔗 [Pump\\.fun]({PUMP_FRONT}/{mint})"
+                            f"ðŸª™ {mdcode(mint)}\n"
+                            f"ðŸ”— [Pump\\.fun]({PUMP_FRONT}/{mint})"
                         )
                         for chat_id in list(state.alerts.keys()):
                             try:
@@ -154,7 +156,7 @@ async def stream(
                 await session.close()
             raise
         except Exception as e:
-            log.warning("WS dropped: %s — retry in %ss", e, delay)
+            log.warning("WS dropped: %s â€” retry in %ss", e, delay)
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60)
         finally:
@@ -163,3 +165,4 @@ async def stream(
                     await session.close()
                 except Exception:
                     pass
+

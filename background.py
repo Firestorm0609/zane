@@ -12,7 +12,7 @@ from telegram import Bot
 from telegram.error import TelegramError
 
 from .config import (
-    BLACKLIST_CACHE_TTL_SEC, DB_BACKUP_INTERVAL_SEC, DB_BACKUP_PATH,
+    DB_BACKUP_INTERVAL_SEC, DB_BACKUP_PATH,
     DEAD_LETTER_MAX_RETRIES, DEAD_LETTER_RETRY_SEC, OUTCOME_NOTIFY_ENABLED,
     OUTCOME_NOTIFY_MIN_PCT, PUMP_FRONT, STREAM_DEAD_ALERT_SEC,
     STREAM_DEAD_COOLDOWN_SEC,
@@ -22,7 +22,7 @@ from .enrichment import enrich_from_pumpfun, fetch_coin_mc
 from .market import MarketContext
 from .processor import process_coin
 from .scoring import ScoringEngine
-from .state import BotState, blacklist_cache
+from .state import BotState
 from .utils import (
     fmt_duration, fmt_pct, fmt_usd, mdbold, mdcode, now_ts, safe_float, safe_int,
 )
@@ -46,7 +46,6 @@ async def watchlist_monitor_loop(bot: Bot) -> None:
 
             if rows:
                 chat_map: dict[str, list[int]] = defaultdict(list)
-                # Track the earliest added_at per mint for a correct entry baseline.
                 added_at_map: dict[str, int] = {}
                 for c in chats:
                     m = c["mint"]
@@ -55,7 +54,6 @@ async def watchlist_monitor_loop(bot: Bot) -> None:
                     if m not in added_at_map or t < added_at_map[m]:
                         added_at_map[m] = t
 
-                # Pre-load all entry snapshots in one executor call (non-blocking).
                 def _fetch_entry_snaps(mint_list, at_map):
                     snaps = {}
                     with closing(db_conn()) as conn:
@@ -88,13 +86,13 @@ async def watchlist_monitor_loop(bot: Bot) -> None:
                         pct_str = ""
                         if entry_mc > 0:
                             pct = ((mc - entry_mc) / entry_mc) * 100
-                            pe = "ðŸŸ¢" if pct > 0 else ("ðŸ”´" if pct < 0 else "âšª")
+                            pe = "\U0001F7E2" if pct > 0 else ("\U0001F534" if pct < 0 else "\u26AA")
                             pct_str = f" {pe} {mdcode(fmt_pct(pct, 1, signed=True))}"
 
                         text = (
-                            f"ðŸ‘ {mdbold(name)} watchlist update\n"
+                            f"\U0001F441 {mdbold(name)} watchlist update\n"
                             f"MC {mdcode(fmt_usd(mc))}{pct_str}\n"
-                            f"ðŸ”— [Pump\\.fun]({PUMP_FRONT}/{mint})"
+                            f"\U0001F517 [Pump\\.fun]({PUMP_FRONT}/{mint})"
                         )
                         for chat_id in chat_map.get(mint, []):
                             try:
@@ -154,9 +152,9 @@ async def outcome_notify_loop(bot: Bot, state: BotState) -> None:
                     mint    = row["mint"] or ""
 
                     if outcome in ("PUMP", "MOON"):
-                        emoji = "ðŸš€" if outcome == "MOON" else "ðŸ“Œ"
+                        emoji = "\U0001F680" if outcome == "MOON" else "\U0001F4CC"
                     else:
-                        emoji = "ðŸ’€"
+                        emoji = "\U0001F480"
 
                     text = "\n".join([
                         f"{emoji} {mdbold('Outcome Alert')}",
@@ -164,7 +162,7 @@ async def outcome_notify_loop(bot: Bot, state: BotState) -> None:
                         f"Result \\({window}\\): {mdbold(outcome)} "
                         f"{mdcode(fmt_pct(pct, 1, signed=True))}",
                         f"Entry MC: {mdcode(fmt_usd(mc))}",
-                        f"ðŸ”— [Pump\\.fun]({PUMP_FRONT}/{mint})" if mint else "",
+                        f"\U0001F517 [Pump\\.fun]({PUMP_FRONT}/{mint})" if mint else "",
                     ])
 
                     for chat_id in list(state.alerts.keys()):
@@ -188,12 +186,12 @@ async def stream_watchdog_loop(bot: Bot, state: BotState) -> None:
     while True:
         try:
             dead_sec = time.time() - state.last_coin_ts
-            now_t = time.time()
+            now_t    = time.time()
             if (dead_sec > STREAM_DEAD_ALERT_SEC
                     and not state.stream_dead_alerted
                     and (now_t - state.stream_dead_alert_at) > STREAM_DEAD_COOLDOWN_SEC):
                 msg = (
-                    f"âš ï¸ {mdbold('Stream Warning')}\n"
+                    f"\u26A0\uFE0F {mdbold('Stream Warning')}\n"
                     f"No coins received for {mdcode(fmt_duration(int(dead_sec)))}\\. "
                     f"WebSocket may be down\\."
                 )
@@ -205,7 +203,7 @@ async def stream_watchdog_loop(bot: Bot, state: BotState) -> None:
                         log.error("watchdog alert failed %s: %s", chat_id, e)
                 state.stream_dead_alerted = True
                 state.stream_dead_alert_at = now_t
-                log.warning("Stream dead for %.0fs â€” alert sent", dead_sec)
+                log.warning("Stream dead for %.0fs \u2014 alert sent", dead_sec)
         except Exception as e:
             log.error("stream_watchdog_loop: %s", e)
         await asyncio.sleep(60)
@@ -218,11 +216,10 @@ async def db_backup_loop() -> None:
     while True:
         try:
             def _backup():
-                with closing(db_conn()) as src:
-                    backup_conn = sqlite3.connect(DB_BACKUP_PATH, timeout=30)
-                    with backup_conn:
-                        src.backup(backup_conn)
-                    backup_conn.close()
+                # Use closing() for both connections to guarantee close on error
+                with closing(db_conn()) as src, \
+                     closing(sqlite3.connect(DB_BACKUP_PATH, timeout=30)) as backup_conn:
+                    src.backup(backup_conn)
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, _backup)
             log.info("Database backed up to %s", DB_BACKUP_PATH)
@@ -231,18 +228,10 @@ async def db_backup_loop() -> None:
         await asyncio.sleep(DB_BACKUP_INTERVAL_SEC)
 
 
-# ---------- Blacklist cache refresh ----------
-
-async def blacklist_refresh_loop() -> None:
-    while True:
-        await asyncio.sleep(BLACKLIST_CACHE_TTL_SEC)
-        try:
-            blacklist_cache.invalidate()
-        except Exception as e:
-            log.error("blacklist_refresh_loop: %s", e)
-
-
 # ---------- Dead letter retry ----------
+# Note: blacklist_refresh_loop has been removed.
+# BlacklistCache already auto-refreshes via its internal TTL on every
+# contains() call, so a separate loop was redundant and added no value.
 
 async def dead_letter_retry_loop(
     bot: Bot, engine: ScoringEngine,
@@ -298,5 +287,4 @@ async def dead_letter_retry_loop(
         except Exception as e:
             log.error("dead_letter_retry_loop: %s", e)
         await asyncio.sleep(DEAD_LETTER_RETRY_SEC)
-
 

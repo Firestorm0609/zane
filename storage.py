@@ -85,11 +85,22 @@ def _rotate_dead_letter_fallback() -> None:
 
 
 def save_dead_letter(mint: str, raw_data: dict, error: str) -> None:
+    _MAX_RAW_BYTES = 8_000   # prevent bloated dead-letter rows
+
     def _w():
+        serialised = json.dumps(raw_data, default=str)
+        if len(serialised) > _MAX_RAW_BYTES:
+            # Store only the essential fields needed for retry
+            trimmed = {k: raw_data.get(k) for k in (
+                "mint", "name", "symbol", "description",
+                "twitter", "telegram", "website",
+                "reply_count", "usd_market_cap", "creator",
+            )}
+            serialised = json.dumps(trimmed, default=str)
         with closing(db_conn()) as conn, conn:
             conn.execute(
                 "INSERT INTO dead_letters(mint,raw_data,error,created_at) VALUES(?,?,?,?)",
-                (mint, json.dumps(raw_data, default=str), str(error)[:1000], now_ts()))
+                (mint, serialised, str(error)[:1000], now_ts()))
     try:
         db_write(_w)
     except Exception as e:
@@ -103,3 +114,4 @@ def save_dead_letter(mint: str, raw_data: dict, error: str) -> None:
                 }) + "\n")
         except Exception as e2:
             log.error("Fallback file write also failed: %s", e2)
+

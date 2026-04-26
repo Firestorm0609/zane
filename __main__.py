@@ -9,7 +9,7 @@ from telegram.ext import (
 )
 
 from .background import (
-    blacklist_refresh_loop, db_backup_loop, dead_letter_retry_loop,
+    db_backup_loop, dead_letter_retry_loop,
     outcome_notify_loop, stream_watchdog_loop, watchlist_monitor_loop,
 )
 from .config import BOT_TOKEN, LOG_PATH, MODEL_VERSION, PAPER_ENABLED_DEFAULT
@@ -28,6 +28,7 @@ from .commands import (
 from .keywords import KeywordModel
 from .lookback import lookback_loop, train_executor, training_loop
 from .market import MarketContext
+from .processor import init_semaphore
 from .scoring import ScoringEngine
 from .state import BotState
 from .stream import get_active_tasks, stream
@@ -61,6 +62,9 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def run() -> None:
     init_db()
+
+    # Create semaphore inside the running event loop (safe on all Python versions)
+    init_semaphore()
 
     market_ctx    = MarketContext()
     keyword_model = KeywordModel()
@@ -145,7 +149,8 @@ async def run() -> None:
                 outcome_notify_loop(app.bot, state),     name="outcome_notify"),
             asyncio.create_task(
                 watchlist_monitor_loop(app.bot),         name="watchlist_monitor"),
-            asyncio.create_task(blacklist_refresh_loop(), name="blacklist_refresh"),
+            # blacklist_refresh_loop removed: BlacklistCache already auto-refreshes
+            # via its internal TTL on every lookup — a separate loop was redundant.
         ]
 
         try:
@@ -171,12 +176,12 @@ async def run() -> None:
 
             try:
                 await app.updater.stop()
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("Error stopping updater during shutdown: %s", e)
             try:
                 await app.stop()
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("Error stopping app during shutdown: %s", e)
 
             train_executor.shutdown(wait=False)
 
@@ -193,3 +198,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

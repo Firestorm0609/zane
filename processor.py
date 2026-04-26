@@ -1,6 +1,7 @@
 """Main per-coin processing pipeline."""
 import asyncio
 import logging
+import time as _time
 
 from telegram import Bot
 
@@ -21,7 +22,23 @@ from .utils import safe_float, safe_int
 
 log = logging.getLogger(__name__)
 
-_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PROCESS)
+# Semaphore is created lazily on first use (or explicitly via init_semaphore)
+# to avoid creating asyncio primitives before an event loop is running,
+# which raises DeprecationWarning on Python < 3.10.
+_semaphore: asyncio.Semaphore | None = None
+
+
+def init_semaphore() -> None:
+    """Call once from inside the running event loop (e.g. at bot startup)."""
+    global _semaphore
+    _semaphore = asyncio.Semaphore(MAX_CONCURRENT_PROCESS)
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    global _semaphore
+    if _semaphore is None:
+        _semaphore = asyncio.Semaphore(MAX_CONCURRENT_PROCESS)
+    return _semaphore
 
 
 def hard_filter(coin: dict) -> tuple[bool, str]:
@@ -42,8 +59,7 @@ def hard_filter(coin: dict) -> tuple[bool, str]:
 
 async def process_coin(coin: dict, bot: Bot, engine: ScoringEngine,
                        market_ctx: MarketContext, state: BotState) -> None:
-    import time
-    async with _semaphore:
+    async with _get_semaphore():
         loop = asyncio.get_running_loop()
         try:
             mint = coin.get("mint", "")
@@ -53,7 +69,8 @@ async def process_coin(coin: dict, bot: Bot, engine: ScoringEngine,
             if await state.seen_recently(mint):
                 return
 
-            state.last_coin_ts = time.time()
+            # Update stream-health state atomically (single field write)
+            state.last_coin_ts = _time.time()
             state.stream_dead_alerted = False
 
             mc      = safe_float(coin.get("usd_market_cap"))
@@ -87,8 +104,7 @@ async def process_coin(coin: dict, bot: Bot, engine: ScoringEngine,
         except Exception as e:
             log.error("process_coin failed for %s: %s",
                       (coin.get("mint", "?") or "?")[:8], e)
-            if coin.get("mint"):
-                await state.mark_seen(coin["mint"])
-            if coin.get("mint"):
-                await state.mark_seen(coin["mint"])
+            mint = coin.get("mint")
+            if mint:
+                await state.mark_seen(mint)
 

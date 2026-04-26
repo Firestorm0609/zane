@@ -25,11 +25,31 @@ class BotState:
         self._paper_on = paper_enabled
         self._pe_lock = asyncio.Lock()
         self.last_coin_ts = time.time()
-        self.stream_dead_alerted = False
-        self.stream_dead_alert_at = 0.0
+        # Use a single float for stream-dead state: 0.0 = not alerted,
+        # >0 = unix timestamp when the alert was sent.
+        # Reading/writing a single float is atomic in CPython, so
+        # last_coin_ts and stream_dead_alerted stay consistent.
+        self._stream_dead_alerted_at: float = 0.0
         self._graduated_order: deque = deque(maxlen=MAX_GRADUATED_ENTRIES)
         self._graduated: set[str] = set()
         self._graduated_lock = asyncio.Lock()
+
+    @property
+    def stream_dead_alerted(self) -> bool:
+        return self._stream_dead_alerted_at > 0.0
+
+    @stream_dead_alerted.setter
+    def stream_dead_alerted(self, value: bool) -> None:
+        # Keeps old code (state.stream_dead_alerted = False) working.
+        self._stream_dead_alerted_at = time.time() if value else 0.0
+
+    @property
+    def stream_dead_alert_at(self) -> float:
+        return self._stream_dead_alerted_at
+
+    @stream_dead_alert_at.setter
+    def stream_dead_alert_at(self, value: float) -> None:
+        self._stream_dead_alerted_at = value
 
     @property
     def paper_enabled(self) -> bool:
@@ -101,14 +121,21 @@ class BlacklistCache:
         self._ttl = ttl
 
     def _refresh_locked(self) -> None:
+        # Fetch from DB first (outside the lock would be ideal, but we're
+        # already inside it here — open the connection quickly and release).
+        # To avoid blocking threads for up to 30 s, we set a short pessimistic
+        # expiry and let the next caller try again if the DB is slow.
+        self._expires = time.time() + 10   # pessimistic; overwritten on success
         try:
             with closing(db_conn()) as conn:
                 rows = conn.execute("SELECT creator FROM creator_blacklist").fetchall()
-            self._set = {r["creator"] for r in rows if r["creator"]}
-            self._expires = time.time() + self._ttl
+            new_set = {r["creator"] for r in rows if r["creator"]}
         except Exception as e:
             log.warning("BlacklistCache refresh failed: %s", e)
-            self._expires = time.time() + 10
+            return
+        # Swap atomically while still inside the lock
+        self._set = new_set
+        self._expires = time.time() + self._ttl
 
     def contains(self, creator: str) -> bool:
         if not creator:
@@ -128,3 +155,4 @@ blacklist_cache = BlacklistCache()
 
 def is_creator_blacklisted(creator: str) -> bool:
     return blacklist_cache.contains(creator)
+

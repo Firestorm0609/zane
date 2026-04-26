@@ -23,6 +23,14 @@ from .wallet import PaperWallet, daily_pnl_usd, recent_loss_streak
 
 log = logging.getLogger(__name__)
 
+# ---------- adaptive_params TTL cache ----------
+# Called from both the real-time stream path and paper_monitor_loop.
+# A 30-second cache eliminates redundant DB queries without staling the signal.
+import time as _time
+_adaptive_cache: "tuple[float, float, int] | None" = None
+_adaptive_cache_ts: float = 0.0
+_ADAPTIVE_CACHE_TTL = 30.0
+
 
 @dataclass
 class OpenTrade:
@@ -72,6 +80,35 @@ def calc_position_size(result: dict) -> float:
     return round(min(size, balance * 0.95), 2)
 
 
+def _get_entry_risk_state(mint: str) -> dict:
+    """Single DB round-trip for all paper_entry_allowed risk checks."""
+    cutoff = now_ts() - 86400
+    with closing(db_conn()) as conn:
+        wallet = conn.execute(
+            "SELECT balance_usd, starting_usd FROM paper_wallet WHERE id=1"
+        ).fetchone()
+        last_trade = conn.execute(
+            "SELECT COALESCE(MAX(entry_time), 0) AS t FROM paper_trades WHERE mint=?",
+            (mint,),
+        ).fetchone()
+        streak_rows = conn.execute(
+            "SELECT pnl_pct FROM paper_trades WHERE status='CLOSED' "
+            "ORDER BY exit_time DESC LIMIT 5"
+        ).fetchall()
+        daily_row = conn.execute(
+            "SELECT COALESCE(SUM(pnl_usd), 0) AS s FROM paper_trades "
+            "WHERE status='CLOSED' AND exit_time >= ?",
+            (cutoff,),
+        ).fetchone()
+    return {
+        "balance":         safe_float(wallet["balance_usd"])  if wallet else 0.0,
+        "starting":        safe_float(wallet["starting_usd"]) if wallet else PAPER_STARTING_BALANCE_USD,
+        "last_trade_time": int(last_trade["t"]) if last_trade and last_trade["t"] else None,
+        "streak_rows":     streak_rows,
+        "daily_pnl":       safe_float(daily_row["s"]) if daily_row else 0.0,
+    }
+
+
 def paper_entry_allowed(state: BotState, coin: dict, result: dict) -> tuple[bool, str]:
     if not state.paper_enabled:
         return False, "paper disabled"
@@ -80,9 +117,6 @@ def paper_entry_allowed(state: BotState, coin: dict, result: dict) -> tuple[bool
     mint = coin.get("mint", "")
     if not mint:
         return False, "no mint"
-    lt = last_trade_time_for_mint(mint)
-    if lt and (now_ts() - lt) < PAPER_MINT_COOLDOWN_SEC:
-        return False, "mint cooldown"
     mc = safe_float(coin.get("usd_market_cap"))
     if mc <= 0:
         return False, "invalid mc"
@@ -92,16 +126,26 @@ def paper_entry_allowed(state: BotState, coin: dict, result: dict) -> tuple[bool
     if cv_std > CONFIDENCE_GATE_STD:
         return False, f"low confidence (std={cv_std:.3f})"
 
-    balance = PaperWallet.get_balance()
-    if balance < 10:
+    risk = _get_entry_risk_state(mint)
+
+    lt = risk["last_trade_time"]
+    if lt and (now_ts() - lt) < PAPER_MINT_COOLDOWN_SEC:
+        return False, "mint cooldown"
+    if risk["balance"] < 10:
         return False, "insufficient balance"
 
-    streak = recent_loss_streak()
+    # Only count the leading (most-recent) run of losses
+    streak = 0
+    for r in risk["streak_rows"]:
+        if safe_float(r["pnl_pct"]) < 0:
+            streak += 1
+        else:
+            break
     if streak >= PAPER_LOSS_STREAK_PAUSE:
         return False, f"loss streak ({streak} losses)"
 
-    daily = daily_pnl_usd()
-    starting = PaperWallet.get_starting()
+    starting = risk["starting"]
+    daily = risk["daily_pnl"]
     daily_loss_pct = abs(daily) / starting * 100 if (daily < 0 and starting > 0) else 0
     if daily_loss_pct >= PAPER_DAILY_LOSS_LIMIT_PCT:
         return False, f"daily loss limit hit ({daily_loss_pct:.1f}%)"
@@ -222,7 +266,10 @@ def close_trade(trade: OpenTrade, exit_mc: float, reason: str) -> None:
 
     closed = db_write(_atomic)
     if closed:
-        maybe_auto_blacklist_creator(trade.mint)
+        # NOTE: maybe_auto_blacklist_creator is intentionally NOT called here.
+        # At close time, creator_history.outcome is still NULL (the lookback loop
+        # hasn't run yet). The auto-blacklist check is triggered from
+        # lookback.py after the outcome label is written.
         log.info("PAPER CLOSE | %s | %+.2f%% pnl=$%.2f balance=$%.2f | %s",
                  trade.name or trade.mint[:8], pnl_pct, pnl_usd,
                  PaperWallet.get_balance(), reason)
@@ -294,22 +341,14 @@ def maybe_open_paper_trade(state: BotState, coin: dict, result: dict) -> None:
 def adaptive_params() -> tuple[float, float, int]:
     """Return (sl_pct, tp_pct, time_stop_sec) scaled continuously to recent performance.
 
-    Pulls the last 20 closed trades and computes two signals:
-      - win_rate:      fraction of winning trades (0.0–1.0)
-      - edge:          mean PnL weighted by direction — positive means
-                       wins are large relative to losses, negative means
-                       the opposite. Normalised to roughly ±1.
-
-    Both signals are blended into a single performance score (-1 to +1)
-    which drives smooth multipliers for SL, TP, and time stop:
-
-      score < 0  → performance poor  → tighten SL, shorten time stop
-      score > 0  → performance good  → widen TP, lengthen time stop
-      score = 0  → neutral           → use config defaults
-
-    Floors and ceilings prevent the values from going to extremes.
-    Requires at least 10 trades; falls back to config defaults otherwise.
+    Result is cached for _ADAPTIVE_CACHE_TTL seconds to avoid a DB
+    round-trip on every coin that enters the monitoring pipeline.
     """
+    global _adaptive_cache, _adaptive_cache_ts
+    now_mono = _time.monotonic()
+    if _adaptive_cache is not None and (now_mono - _adaptive_cache_ts) < _ADAPTIVE_CACHE_TTL:
+        return _adaptive_cache
+
     with closing(db_conn()) as conn:
         rows = conn.execute(
             "SELECT pnl_pct, reason FROM paper_trades WHERE status='CLOSED' "
@@ -363,7 +402,10 @@ def adaptive_params() -> tuple[float, float, int]:
             PAPER_TIME_STOP_SEC * time_mult)
     ))
 
-    return round(sl, 1), round(tp, 1), time_sec
+    result = round(sl, 1), round(tp, 1), time_sec
+    _adaptive_cache = result
+    _adaptive_cache_ts = _time.monotonic()
+    return result
 
 
 def adaptive_sl_tp() -> tuple[float, float]:
@@ -454,5 +496,6 @@ def paper_stats() -> dict:
         "worst_pnl_pct":    min((safe_float(r["pnl_pct"]) for r in closed_chrono), default=0.0),
         "max_drawdown_usd": max_dd,
     }
+
 
 

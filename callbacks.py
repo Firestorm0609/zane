@@ -5,7 +5,7 @@ from telegram import Update
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import ContextTypes
 
-from .config import DEFAULT_THRESHOLD
+from .config import ALLOWED_CHAT_IDS, DEFAULT_THRESHOLD
 from .db import set_state, upsert_chat
 from .keyboards import (
     MENU_HEADER, back_keyboard, main_menu_keyboard, threshold_keyboard,
@@ -33,8 +33,17 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+    cid = update.effective_chat.id
+
+    # Enforce the same allow-list as commands — callbacks bypass CommandHandler
+    if ALLOWED_CHAT_IDS and cid not in ALLOWED_CHAT_IDS:
+        try:
+            await query.answer("Unauthorized", show_alert=True)
+        except Exception:
+            pass
+        return
+
     data = query.data
-    cid  = update.effective_chat.id
     state:  BotState       = ctx.bot_data["state"]
     engine: ScoringEngine  = ctx.bot_data["engine"]
     mctx:   MarketContext  = ctx.bot_data["market_ctx"]
@@ -154,3 +163,4 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         log.error("handle_callback error for %s: %s", data, e, exc_info=True)
+

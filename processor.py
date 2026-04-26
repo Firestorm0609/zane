@@ -62,8 +62,6 @@ async def process_coin(coin: dict, bot: Bot, engine: ScoringEngine,
             if mc > 0:
                 market_ctx.update(mc, replies)
 
-            # Offload blocking DB writes + CPU-bound scoring to the thread pool
-            # so the event loop is not stalled under concurrent load.
             await loop.run_in_executor(None, save_snapshot, coin)
             await loop.run_in_executor(None, maybe_close_paper_trades_for_coin, coin)
 
@@ -89,6 +87,8 @@ async def process_coin(coin: dict, bot: Bot, engine: ScoringEngine,
         except Exception as e:
             log.error("process_coin failed for %s: %s",
                       (coin.get("mint", "?") or "?")[:8], e)
+            if coin.get("mint"):
+                await state.mark_seen(coin["mint"])
             if coin.get("mint"):
                 await state.mark_seen(coin["mint"])
 

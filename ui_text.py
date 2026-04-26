@@ -15,7 +15,7 @@ from .db import db_conn, get_state
 from .market import MarketContext
 from .scoring import ScoringEngine
 from .state import BotState
-from .trading import adaptive_sl_tp, paper_stats
+from .trading import adaptive_params, adaptive_sl_tp, paper_stats
 from .utils import (
     REC_EMOJI, fmt_duration, fmt_pct, fmt_prob, fmt_usd,
     mdbold, mdcode, mditalic, now_ts, safe_float, safe_int, score_emoji,
@@ -280,11 +280,18 @@ def text_paper_status(state: BotState) -> str:
     s = paper_stats()
     s["paper_enabled"] = state.paper_enabled
     status = "ON" if s["paper_enabled"] else "OFF"
+    live_sl, live_tp, live_time = adaptive_params()
+    is_adapted = (
+        live_sl != PAPER_STOP_LOSS_PCT
+        or live_tp != PAPER_TAKE_PROFIT_PCT
+        or live_time != PAPER_TIME_STOP_SEC
+    )
+    adapt_note = " \\(adaptive\\)" if is_adapted else ""
     return (
         f"📋 {mdbold('Paper:')} {mdbold(status)}\n"
-        f"SL {mdcode(f'-{PAPER_STOP_LOSS_PCT}%')} \\| "
-        f"TP {mdcode(f'+{PAPER_TAKE_PROFIT_PCT}%')} \\| "
-        f"Time {mdcode(f'{PAPER_TIME_STOP_SEC}s')}\n\n"
+        f"SL {mdcode(f'-{live_sl:.1f}%')} \\| "
+        f"TP {mdcode(f'+{live_tp:.1f}%')} \\| "
+        f"Time {mdcode(f'{live_time}s')}{adapt_note}\n\n"
         f"Open {mdcode(s['open_positions'])} \\| "
         f"Closed {mdcode(s['closed_positions'])}\n"
         f"Win rate {mdcode(str(round(s['win_rate'],1))+'%')} \\| "

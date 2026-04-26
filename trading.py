@@ -291,25 +291,84 @@ def maybe_open_paper_trade(state: BotState, coin: dict, result: dict) -> None:
         log.debug("PAPER SKIP | %s | %s", (coin.get("mint") or "?")[:8], reason)
 
 
-def adaptive_sl_tp() -> tuple[float, float]:
+def adaptive_params() -> tuple[float, float, int]:
+    """Return (sl_pct, tp_pct, time_stop_sec) scaled continuously to recent performance.
+
+    Pulls the last 20 closed trades and computes two signals:
+      - win_rate:      fraction of winning trades (0.0–1.0)
+      - edge:          mean PnL weighted by direction — positive means
+                       wins are large relative to losses, negative means
+                       the opposite. Normalised to roughly ±1.
+
+    Both signals are blended into a single performance score (-1 to +1)
+    which drives smooth multipliers for SL, TP, and time stop:
+
+      score < 0  → performance poor  → tighten SL, shorten time stop
+      score > 0  → performance good  → widen TP, lengthen time stop
+      score = 0  → neutral           → use config defaults
+
+    Floors and ceilings prevent the values from going to extremes.
+    Requires at least 10 trades; falls back to config defaults otherwise.
+    """
     with closing(db_conn()) as conn:
         rows = conn.execute(
-            "SELECT pnl_pct FROM paper_trades WHERE status='CLOSED' "
+            "SELECT pnl_pct, reason FROM paper_trades WHERE status='CLOSED' "
             "ORDER BY exit_time DESC LIMIT 20"
         ).fetchall()
+
     if len(rows) < 10:
-        return PAPER_STOP_LOSS_PCT, PAPER_TAKE_PROFIT_PCT
-    wins = sum(1 for r in rows if safe_float(r["pnl_pct"]) > 0)
-    win_rate = wins / len(rows)
-    if win_rate < 0.40:
-        sl = max(10.0, PAPER_STOP_LOSS_PCT * 0.75)
-        tp = PAPER_TAKE_PROFIT_PCT
-    elif win_rate > 0.60:
-        sl = PAPER_STOP_LOSS_PCT
-        tp = min(100.0, PAPER_TAKE_PROFIT_PCT * 1.25)
+        return PAPER_STOP_LOSS_PCT, PAPER_TAKE_PROFIT_PCT, PAPER_TIME_STOP_SEC
+
+    pnls = [safe_float(r["pnl_pct"]) for r in rows]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
+    win_rate = len(wins) / len(pnls)
+
+    # Edge: average win minus average loss magnitude, normalised by TP baseline
+    avg_win  = sum(wins)  / len(wins)  if wins   else 0.0
+    avg_loss = sum(losses) / len(losses) if losses else 0.0
+    edge_raw = avg_win + avg_loss  # avg_loss is already negative
+    edge = max(-1.0, min(1.0, edge_raw / max(PAPER_TAKE_PROFIT_PCT, 1.0)))
+
+    # Blend: win_rate centred at 0.5, edge already centred at 0
+    wr_signal = (win_rate - 0.5) * 2.0   # maps 0–1 → -1 to +1
+    score = 0.6 * wr_signal + 0.4 * edge  # weighted blend, still -1 to +1
+
+    # Time-stop rate — how often are we closing on time rather than SL/TP?
+    time_stopped = sum(1 for r in rows if (r["reason"] or "").startswith("TIME_STOP"))
+    time_stop_rate = time_stopped / len(rows)
+
+    # --- SL: tighten when score < 0 (poor performance), floor at 50% of default ---
+    sl_mult = 1.0 + min(0.0, score) * 0.5   # score=-1 → mult=0.5; score≥0 → mult=1.0
+    sl = max(PAPER_STOP_LOSS_PCT * 0.5, PAPER_STOP_LOSS_PCT * sl_mult)
+
+    # --- TP: widen when score > 0 (good performance), ceiling at 2× default ---
+    tp_mult = 1.0 + max(0.0, score) * 1.0   # score=+1 → mult=2.0; score≤0 → mult=1.0
+    tp = min(PAPER_TAKE_PROFIT_PCT * 2.0, PAPER_TAKE_PROFIT_PCT * tp_mult)
+
+    # --- Time stop: shorten on poor performance, lengthen if time-stops are common
+    #     and performance is good (coins keep moving after we exit) ---
+    if score < 0:
+        # Poor perf — exit stale trades faster, proportional to how bad it is
+        time_mult = 1.0 + score * 0.5       # score=-1 → mult=0.5
+    elif time_stop_rate > 0.25 and score >= 0:
+        # Many trades hitting time stop while winning — give them more room
+        time_mult = 1.0 + score * 1.0       # score=+1 → mult=2.0
     else:
-        sl = PAPER_STOP_LOSS_PCT
-        tp = PAPER_TAKE_PROFIT_PCT
+        time_mult = 1.0
+
+    time_sec = int(max(
+        300,                                  # floor: 5 minutes
+        min(4 * 3600,                         # ceiling: 4 hours
+            PAPER_TIME_STOP_SEC * time_mult)
+    ))
+
+    return round(sl, 1), round(tp, 1), time_sec
+
+
+def adaptive_sl_tp() -> tuple[float, float]:
+    """Backwards-compatible shim for callers that only need SL/TP."""
+    sl, tp, _ = adaptive_params()
     return sl, tp
 
 
@@ -318,7 +377,7 @@ def maybe_close_paper_trades_for_coin(coin: dict) -> None:
     current_mc = safe_float(coin.get("usd_market_cap"))
     if not mint or current_mc <= 0:
         return
-    sl_pct, tp_pct = adaptive_sl_tp()
+    sl_pct, tp_pct, time_sec = adaptive_params()
     for t in get_open_trades():
         if t.mint != mint:
             continue
@@ -329,8 +388,8 @@ def maybe_close_paper_trades_for_coin(coin: dict) -> None:
             close_trade(t, current_mc, f"STOP_LOSS_{sl_pct:.1f}%")
         elif pnl_pct >= abs(tp_pct):
             close_trade(t, current_mc, f"TAKE_PROFIT_{tp_pct:.1f}%")
-        elif age_sec >= PAPER_TIME_STOP_SEC:
-            close_trade(t, current_mc, f"TIME_STOP_{PAPER_TIME_STOP_SEC}s")
+        elif age_sec >= time_sec:
+            close_trade(t, current_mc, f"TIME_STOP_{time_sec}s")
 
 
 async def paper_monitor_loop() -> None:
@@ -338,12 +397,12 @@ async def paper_monitor_loop() -> None:
         try:
             trades = get_open_trades()
             if trades:
-                sl_pct, tp_pct = adaptive_sl_tp()
+                sl_pct, tp_pct, time_sec = adaptive_params()
                 async with aiohttp.ClientSession() as session:
                     for t in trades:
                         mc = await fetch_coin_mc(session, t.mint)
                         if mc is None:
-                            if now_ts() - t.entry_time >= PAPER_TIME_STOP_SEC:
+                            if now_ts() - t.entry_time >= time_sec:
                                 close_trade(t, t.entry_mc, "TIME_STOP_NO_DATA")
                             continue
 
@@ -357,8 +416,8 @@ async def paper_monitor_loop() -> None:
                             close_trade(t, mc, f"STOP_LOSS_{sl_pct:.1f}%")
                         elif pnl_pct >= abs(tp_pct):
                             close_trade(t, mc, f"TAKE_PROFIT_{tp_pct:.1f}%")
-                        elif age_sec >= PAPER_TIME_STOP_SEC:
-                            close_trade(t, mc, f"TIME_STOP_{PAPER_TIME_STOP_SEC}s")
+                        elif age_sec >= time_sec:
+                            close_trade(t, mc, f"TIME_STOP_{time_sec}s")
         except Exception as e:
             log.error("paper_monitor_loop: %s", e)
         await asyncio.sleep(PAPER_POLL_INTERVAL_SEC)
@@ -395,4 +454,5 @@ def paper_stats() -> dict:
         "worst_pnl_pct":    min((safe_float(r["pnl_pct"]) for r in closed_chrono), default=0.0),
         "max_drawdown_usd": max_dd,
     }
+
 

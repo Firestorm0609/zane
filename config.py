@@ -83,7 +83,7 @@ STREAM_DEAD_ALERT_SEC    = int(os.getenv("STREAM_DEAD_ALERT_SEC", str(10 * 60)))
 STREAM_DEAD_COOLDOWN_SEC = int(os.getenv("STREAM_DEAD_COOLDOWN_SEC", str(30 * 60)))
 
 # Outcome notifications
-OUTCOME_NOTIFY_ENABLED = os.getenv("OUTCOME_NOTIFY_ENABLED", "true").lower() == "true"
+OUTCOME_NOTIFY_ENABLED = os.getenv("OUTCOME_NOTIFY_ENABLED", "false").lower() == "true"
 OUTCOME_NOTIFY_MIN_PCT = float(os.getenv("OUTCOME_NOTIFY_MIN_PCT", "50"))
 
 # Backups
@@ -118,3 +118,4 @@ try:
 except ImportError:
     ML_AVAILABLE = False
 ALLOWED_CHAT_IDS = set(int(x) for x in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if x.strip())
+

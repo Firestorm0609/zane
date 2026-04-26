@@ -117,3 +117,4 @@ try:
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
+ALLOWED_CHAT_IDS = set(int(x) for x in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if x.strip())

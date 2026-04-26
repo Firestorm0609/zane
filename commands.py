@@ -90,7 +90,20 @@ async def do_train(engine: ScoringEngine) -> str:
 
 # ---------- Basic ----------
 
+
+from .config import ALLOWED_CHAT_IDS
+
+async def _check_allowed(update: Update) -> bool:
+    if not ALLOWED_CHAT_IDS:
+        return True
+    chat_id = update.effective_chat.id
+    if chat_id not in ALLOWED_CHAT_IDS:
+        await update.message.reply_text("⛔ Unauthorized.")
+        return False
+    return True
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     await _reply(
         update,
         f"🤖 {mdbold('Pump.fun Dynamic Monitor v1.1')}\n\n"
@@ -102,16 +115,19 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     await _reply(update, text_help())
 
 
 async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     await _reply(update, MENU_HEADER, kb=main_menu_keyboard())
 
 
 # ---------- Monitor ----------
 
 async def cmd_monitor_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     state = _state(ctx)
     cid   = update.effective_chat.id
     th    = state.alerts.get(cid, DEFAULT_THRESHOLD)
@@ -121,6 +137,7 @@ async def cmd_monitor_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_monitor_off(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     state = _state(ctx)
     state.alerts.pop(update.effective_chat.id, None)
     upsert_chat(update.effective_chat.id, alerts_enabled=0)
@@ -128,10 +145,12 @@ async def cmd_monitor_off(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_monitor_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     await _reply(update, text_monitor_status(update.effective_chat.id, _state(ctx)))
 
 
 async def cmd_set_threshold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     state = _state(ctx)
     cid   = update.effective_chat.id
     if not ctx.args or not ctx.args[0].lstrip("-").isdigit():
@@ -149,42 +168,51 @@ async def cmd_set_threshold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ---------- Info ----------
 
 async def cmd_scoring_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     await _reply(update, text_scoring_mode(ctx.bot_data["engine"]))
 
 
 async def cmd_features(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     await _reply(update, text_features(ctx.bot_data["engine"]))
 
 
 async def cmd_keywords(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     await _reply(update, text_keywords(ctx.bot_data["engine"]))
 
 
 async def cmd_market(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     await _reply(update, text_market(ctx.bot_data["market_ctx"]))
 
 
 async def cmd_outcomes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     await _reply(update, text_outcomes())
 
 
 async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     await _reply(update, text_model(ctx.bot_data["engine"]))
 
 
 async def cmd_train(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     engine: ScoringEngine = ctx.bot_data["engine"]
     await _reply(update, "🏋 Training\\.\\.\\.")
     await _reply(update, await do_train(engine))
 
 
 async def cmd_snapshot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     await _reply(update, text_snapshot())
 
 
 # ---------- Paper ----------
 
 async def cmd_paper_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     state = _state(ctx)
     await state.set_paper_enabled(True)
     set_state("paper_engine_enabled", "1")
@@ -195,6 +223,7 @@ async def cmd_paper_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_paper_off(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     state = _state(ctx)
     await state.set_paper_enabled(False)
     set_state("paper_engine_enabled", "0")
@@ -205,30 +234,36 @@ async def cmd_paper_off(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_paper_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     await _reply(update, text_paper_status(_state(ctx)))
 
 
 async def cmd_paper_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     await _reply(update, text_paper_report(_state(ctx)))
 
 
 # ---------- Diagnostics ----------
 
 async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     await _reply(update, text_health(_state(ctx), ctx.bot_data["engine"]))
 
 
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     await _reply(update, text_stats(_state(ctx), ctx.bot_data["engine"]))
 
 
 # ---------- Wallet ----------
 
 async def cmd_wallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     await _reply(update, text_wallet())
 
 
 async def cmd_wallet_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     amount = PAPER_STARTING_BALANCE_USD
     if ctx.args and ctx.args[0].replace(".", "").isdigit():
         amount = float(ctx.args[0])
@@ -243,6 +278,7 @@ async def cmd_wallet_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ---------- Score / backtest / watchlist ----------
 
 async def cmd_score(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     if not ctx.args or len(ctx.args[0]) < 32:
         await _reply(update, f"Usage: {mdcode('/score <mint_address>')}")
         return
@@ -283,6 +319,7 @@ async def cmd_score(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_backtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     await _reply(update, "📊 Running backtest\\.\\.\\.")
     try:
         with closing(db_conn()) as conn:
@@ -338,6 +375,7 @@ async def cmd_backtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     if not ctx.args or len(ctx.args[0]) < 32:
         await _reply(update, f"Usage: {mdcode('/watch <mint_address>')}")
         return
@@ -368,6 +406,7 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_unwatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     if not ctx.args:
         await _reply(update, f"Usage: {mdcode('/unwatch <mint_address>')}")
         return
@@ -385,6 +424,7 @@ async def cmd_unwatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_watchlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     chat_id = update.effective_chat.id
     with closing(db_conn()) as conn:
         rows = conn.execute(
@@ -413,6 +453,7 @@ async def cmd_watchlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ---------- Blacklist / top ----------
 
 async def cmd_blacklist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     args = ctx.args or []
     if not args:
         with closing(db_conn()) as conn:
@@ -466,6 +507,7 @@ async def cmd_blacklist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_top(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _check_allowed(update): return
     days = 7
     if ctx.args and ctx.args[0].isdigit():
         days = max(1, min(30, int(ctx.args[0])))

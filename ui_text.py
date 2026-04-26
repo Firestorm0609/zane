@@ -428,31 +428,35 @@ def text_paper_report(state: BotState) -> str:
 # ---------- Stats / wallet / top ----------
 
 def query_time_to_pump_data() -> list[dict]:
+    # Single DB connection: correlated subqueries run inside one execute() call,
+    # eliminating the N+1 pattern of one connection per signal row.
+    cutoff = now_ts() - 7 * 86400
     with closing(db_conn()) as conn:
         rows = conn.execute("""
-            SELECT s.id, s.score, s.created_at, s.market_cap_at_signal, s.mint
+            SELECT s.score, s.created_at, s.market_cap_at_signal,
+                   (SELECT MAX(p.market_cap)
+                    FROM price_snapshots p
+                    WHERE p.mint = s.mint AND p.created_at >= s.created_at
+                   ) AS peak_mc,
+                   (SELECT p2.created_at
+                    FROM price_snapshots p2
+                    WHERE p2.mint = s.mint AND p2.created_at >= s.created_at
+                    ORDER BY p2.market_cap DESC LIMIT 1
+                   ) AS peak_ts
             FROM signals s
             WHERE s.created_at >= ?
-        """, (now_ts() - 7 * 86400,)).fetchall()
+              AND s.market_cap_at_signal > 0
+        """, (cutoff,)).fetchall()
 
     buckets: dict[str, list[float]] = defaultdict(list)
     for s in rows:
         score    = safe_int(s["score"])
         created  = safe_int(s["created_at"])
         entry_mc = safe_float(s["market_cap_at_signal"])
-        mint     = s["mint"]
-        if entry_mc <= 0:
+        peak_mc  = safe_float(s["peak_mc"]) if s["peak_mc"] is not None else 0.0
+        peak_ts  = safe_int(s["peak_ts"]) if s["peak_ts"] is not None else 0
+        if entry_mc <= 0 or peak_mc <= 0 or peak_ts <= 0:
             continue
-        with closing(db_conn()) as conn:
-            peak = conn.execute("""
-                SELECT market_cap, created_at FROM price_snapshots
-                WHERE mint=? AND created_at >= ?
-                ORDER BY market_cap DESC LIMIT 1
-            """, (mint, created)).fetchone()
-        if not peak:
-            continue
-        peak_mc = safe_float(peak["market_cap"])
-        peak_ts = safe_int(peak["created_at"])
         if peak_mc <= entry_mc * 1.5:
             continue
         mins = (peak_ts - created) / 60.0
@@ -710,3 +714,4 @@ def text_help() -> str:
         "",
         mditalic("Tap Menu below or type any command."),
     ])
+

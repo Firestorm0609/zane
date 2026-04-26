@@ -383,7 +383,8 @@ def paper_stats() -> dict:
         peak    = max(peak, equity)
         max_dd  = max(max_dd, peak - equity)
     return {
-        "paper_enabled":    False,
+        # NOTE: callers must set "paper_enabled" from BotState; this dict
+        # intentionally omits it so accidental direct usage is obvious.
         "open_positions":   int(open_n),
         "closed_positions": n,
         "wins": wins, "losses": n - wins,
@@ -394,3 +395,4 @@ def paper_stats() -> dict:
         "worst_pnl_pct":    min((safe_float(r["pnl_pct"]) for r in closed_chrono), default=0.0),
         "max_drawdown_usd": max_dd,
     }
+

@@ -41,13 +41,40 @@ async def watchlist_monitor_loop(bot: Bot) -> None:
                     "SELECT DISTINCT mint, name, symbol FROM watchlist"
                 ).fetchall()
                 chats = conn.execute(
-                    "SELECT chat_id, mint FROM watchlist"
+                    "SELECT chat_id, mint, added_at FROM watchlist"
                 ).fetchall()
 
             if rows:
                 chat_map: dict[str, list[int]] = defaultdict(list)
+                # Track the earliest added_at per mint for a correct entry baseline.
+                added_at_map: dict[str, int] = {}
                 for c in chats:
-                    chat_map[c["mint"]].append(int(c["chat_id"]))
+                    m = c["mint"]
+                    chat_map[m].append(int(c["chat_id"]))
+                    t = safe_int(c["added_at"])
+                    if m not in added_at_map or t < added_at_map[m]:
+                        added_at_map[m] = t
+
+                # Pre-load all entry snapshots in one executor call (non-blocking).
+                def _fetch_entry_snaps(mint_list, at_map):
+                    snaps = {}
+                    with closing(db_conn()) as conn:
+                        for m in mint_list:
+                            added = at_map.get(m, 0)
+                            row = conn.execute(
+                                "SELECT market_cap FROM price_snapshots "
+                                "WHERE mint=? AND created_at >= ? "
+                                "ORDER BY created_at ASC LIMIT 1",
+                                (m, added),
+                            ).fetchone()
+                            snaps[m] = safe_float(row["market_cap"]) if row else 0.0
+                    return snaps
+
+                loop = asyncio.get_running_loop()
+                mint_list = [r["mint"] for r in rows]
+                entry_snaps: dict[str, float] = await loop.run_in_executor(
+                    None, _fetch_entry_snaps, mint_list, added_at_map
+                )
 
                 async with aiohttp.ClientSession() as session:
                     for row in rows:
@@ -57,23 +84,17 @@ async def watchlist_monitor_loop(bot: Bot) -> None:
                             continue
                         name = row["name"] or row["symbol"] or mint[:8]
 
-                        with closing(db_conn()) as conn:
-                            snap = conn.execute(
-                                "SELECT market_cap FROM price_snapshots "
-                                "WHERE mint=? ORDER BY created_at ASC LIMIT 1",
-                                (mint,),
-                            ).fetchone()
-                        entry_mc = safe_float(snap["market_cap"]) if snap else 0.0
+                        entry_mc = entry_snaps.get(mint, 0.0)
                         pct_str = ""
                         if entry_mc > 0:
                             pct = ((mc - entry_mc) / entry_mc) * 100
-                            pe = "🟢" if pct > 0 else ("🔴" if pct < 0 else "⚪")
+                            pe = "ðŸŸ¢" if pct > 0 else ("ðŸ”´" if pct < 0 else "âšª")
                             pct_str = f" {pe} {mdcode(fmt_pct(pct, 1, signed=True))}"
 
                         text = (
-                            f"👁 {mdbold(name)} watchlist update\n"
+                            f"ðŸ‘ {mdbold(name)} watchlist update\n"
                             f"MC {mdcode(fmt_usd(mc))}{pct_str}\n"
-                            f"🔗 [Pump\\.fun]({PUMP_FRONT}/{mint})"
+                            f"ðŸ”— [Pump\\.fun]({PUMP_FRONT}/{mint})"
                         )
                         for chat_id in chat_map.get(mint, []):
                             try:
@@ -133,9 +154,9 @@ async def outcome_notify_loop(bot: Bot, state: BotState) -> None:
                     mint    = row["mint"] or ""
 
                     if outcome in ("PUMP", "MOON"):
-                        emoji = "🚀" if outcome == "MOON" else "📈"
+                        emoji = "ðŸš€" if outcome == "MOON" else "ðŸ“^"
                     else:
-                        emoji = "💀"
+                        emoji = "ðŸ’€"
 
                     text = "\n".join([
                         f"{emoji} {mdbold('Outcome Alert')}",
@@ -143,7 +164,7 @@ async def outcome_notify_loop(bot: Bot, state: BotState) -> None:
                         f"Result \\({window}\\): {mdbold(outcome)} "
                         f"{mdcode(fmt_pct(pct, 1, signed=True))}",
                         f"Entry MC: {mdcode(fmt_usd(mc))}",
-                        f"🔗 [Pump\\.fun]({PUMP_FRONT}/{mint})" if mint else "",
+                        f"ðŸ”— [Pump\\.fun]({PUMP_FRONT}/{mint})" if mint else "",
                     ])
 
                     for chat_id in list(state.alerts.keys()):
@@ -172,7 +193,7 @@ async def stream_watchdog_loop(bot: Bot, state: BotState) -> None:
                     and not state.stream_dead_alerted
                     and (now_t - state.stream_dead_alert_at) > STREAM_DEAD_COOLDOWN_SEC):
                 msg = (
-                    f"⚠️ {mdbold('Stream Warning')}\n"
+                    f"âš ï¸ {mdbold('Stream Warning')}\n"
                     f"No coins received for {mdcode(fmt_duration(int(dead_sec)))}\\. "
                     f"WebSocket may be down\\."
                 )
@@ -184,7 +205,7 @@ async def stream_watchdog_loop(bot: Bot, state: BotState) -> None:
                         log.error("watchdog alert failed %s: %s", chat_id, e)
                 state.stream_dead_alerted = True
                 state.stream_dead_alert_at = now_t
-                log.warning("Stream dead for %.0fs — alert sent", dead_sec)
+                log.warning("Stream dead for %.0fs â€” alert sent", dead_sec)
         except Exception as e:
             log.error("stream_watchdog_loop: %s", e)
         await asyncio.sleep(60)
@@ -279,3 +300,4 @@ async def dead_letter_retry_loop(
         except Exception as e:
             log.error("dead_letter_retry_loop: %s", e)
         await asyncio.sleep(DEAD_LETTER_RETRY_SEC)
+

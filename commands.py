@@ -20,7 +20,6 @@ from .db import db_conn, db_write, set_state, upsert_chat
 from .enrichment import enrich_with_rpc, fetch_mc_momentum_from_db
 from .keyboards import MENU_HEADER, main_menu_keyboard
 from .lookback import train_executor
-from .market import MarketContext
 from .scoring import ScoringEngine
 from .state import BotState, blacklist_cache
 from .ui_text import (
@@ -98,7 +97,8 @@ async def _check_allowed(update: Update) -> bool:
         return True
     chat_id = update.effective_chat.id
     if chat_id not in ALLOWED_CHAT_IDS:
-        await update.message.reply_text("⛔ Unauthorized.")
+        if update.message:
+            await update.message.reply_text("⛔ Unauthorized.")
         return False
     return True
 
@@ -517,4 +517,5 @@ async def cmd_top(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         days = max(1, min(30, int(ctx.args[0])))
     rows = query_top_performers(days=days)
     await _reply(update, format_top_performers(rows, days))
+
 

@@ -154,7 +154,7 @@ async def outcome_notify_loop(bot: Bot, state: BotState) -> None:
                     mint    = row["mint"] or ""
 
                     if outcome in ("PUMP", "MOON"):
-                        emoji = "ðŸš€" if outcome == "MOON" else "ðŸ“^"
+                        emoji = "ðŸš€" if outcome == "MOON" else "ðŸ“Œ"
                     else:
                         emoji = "ðŸ’€"
 
@@ -286,13 +286,11 @@ async def dead_letter_retry_loop(
                             else:
                                 await process_coin(
                                     coin, bot, engine, market_ctx, state)
-                                def _done(rid=row["id"], ts=ts_now):
+                                def _done(rid=row["id"]):
                                     with closing(db_conn()) as c, c:
                                         c.execute(
-                                            "UPDATE dead_letters "
-                                            "SET retry_count=?,last_retry_at=? "
-                                            "WHERE id=?",
-                                            (DEAD_LETTER_MAX_RETRIES, ts, rid))
+                                            "DELETE FROM dead_letters WHERE id=?",
+                                            (rid,))
                                 await loop.run_in_executor(None, db_write, _done)
                                 log.info("Dead letter retried OK: %s", mint[:8])
                         except Exception as e:
@@ -300,4 +298,5 @@ async def dead_letter_retry_loop(
         except Exception as e:
             log.error("dead_letter_retry_loop: %s", e)
         await asyncio.sleep(DEAD_LETTER_RETRY_SEC)
+
 

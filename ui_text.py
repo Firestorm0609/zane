@@ -8,7 +8,7 @@ from .config import (
     MIN_TRAIN_SAMPLES, ML_LABEL_WINDOW, PAPER_FEE_PCT, PAPER_MAX_CONCURRENT,
     PAPER_POSITION_SIZE_USD, PAPER_SLIPPAGE_PCT, PAPER_STOP_LOSS_PCT,
     PAPER_TAKE_PROFIT_PCT, PAPER_TIME_STOP_SEC, PUMP_FRONT,
-    PUMP_THRESHOLD_PCT, RUG_THRESHOLD_PCT, SNAPSHOT_COUNT,
+    SNAPSHOT_COUNT,
     STREAM_DEAD_ALERT_SEC,
 )
 from .db import db_conn, get_state
@@ -714,4 +714,5 @@ def text_help() -> str:
         "",
         mditalic("Tap Menu below or type any command."),
     ])
+
 

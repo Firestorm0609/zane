@@ -44,6 +44,7 @@ async def process_coin(coin: dict, bot: Bot, engine: ScoringEngine,
                        market_ctx: MarketContext, state: BotState) -> None:
     import time
     async with _semaphore:
+        loop = asyncio.get_running_loop()
         try:
             mint = coin.get("mint", "")
             if not mint:
@@ -60,8 +61,11 @@ async def process_coin(coin: dict, bot: Bot, engine: ScoringEngine,
 
             if mc > 0:
                 market_ctx.update(mc, replies)
-            save_snapshot(coin)
-            maybe_close_paper_trades_for_coin(coin)
+
+            # Offload blocking DB writes + CPU-bound scoring to the thread pool
+            # so the event loop is not stalled under concurrent load.
+            await loop.run_in_executor(None, save_snapshot, coin)
+            await loop.run_in_executor(None, maybe_close_paper_trades_for_coin, coin)
 
             ok, reason = hard_filter(coin)
             if not ok:
@@ -69,19 +73,22 @@ async def process_coin(coin: dict, bot: Bot, engine: ScoringEngine,
                 await state.mark_seen(mint)
                 return
 
-            result    = engine.score(coin)
-            signal_id = save_signal(coin, result)
-            schedule_lookbacks(signal_id, mint)
+            result    = await loop.run_in_executor(None, engine.score, coin)
+            signal_id = await loop.run_in_executor(None, save_signal, coin, result)
+            await loop.run_in_executor(None, schedule_lookbacks, signal_id, mint)
 
             creator = (coin.get("creator") or coin.get("user")
                        or coin.get("traderPublicKey") or "")
             if creator and mint:
-                record_creator_token(creator, mint)
+                await loop.run_in_executor(None, record_creator_token, creator, mint)
 
-            maybe_open_paper_trade(state, coin, result)
+            await loop.run_in_executor(None, maybe_open_paper_trade, state, coin, result)
             await send_alert(bot, coin, result, state)
 
             await state.mark_seen(mint)
         except Exception as e:
             log.error("process_coin failed for %s: %s",
                       (coin.get("mint", "?") or "?")[:8], e)
+            if coin.get("mint"):
+                await state.mark_seen(coin["mint"])
+

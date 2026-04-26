@@ -13,7 +13,7 @@ from .config import (
 )
 from .db import db_conn
 from .ratelimit import pump_api_limiter, rpc_limiter
-from .utils import now_ts, safe_float, safe_int, validate_url
+from .utils import now_ts, safe_float, validate_url
 
 log = logging.getLogger(__name__)
 
@@ -290,3 +290,4 @@ def fetch_mc_momentum_from_db(mint: str, window_sec: int = 1800) -> float:
     except Exception as e:
         log.debug("fetch_mc_momentum_from_db %s: %s", mint[:8], e)
         return 0.0
+

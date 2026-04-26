@@ -13,7 +13,7 @@ from .config import (
 from .db import db_conn, db_write, upsert_chat
 from .state import BotState
 from .utils import (
-    REC_EMOJI, esc, fmt_prob, fmt_usd, mdbold, mdcode, mditalic,
+    REC_EMOJI, fmt_prob, fmt_usd, mdbold, mdcode, mditalic,
     now_ts, safe_float, safe_int, score_emoji, strip_md2, validate_url,
 )
 
@@ -182,3 +182,4 @@ async def send_alert(bot: Bot, coin: dict, result: dict, state: BotState) -> Non
                 except Exception:
                     pass
                 log.warning("Removed unreachable chat %s", chat_id)
+

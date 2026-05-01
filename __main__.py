@@ -106,6 +106,8 @@ async def run() -> None:
         ("paper_off",      cmd_paper_off),
         ("paper_status",   cmd_paper_status),
         ("paper_report",   cmd_paper_report),
+        ("paper_reports_on", cmd_paper_reports_on),
+        ("paper_reports_off", cmd_paper_reports_off),
         ("health",         cmd_health),
         ("score",          cmd_score),
         ("backtest",       cmd_backtest),
@@ -113,6 +115,7 @@ async def run() -> None:
         ("unwatch",        cmd_unwatch),
         ("watchlist",      cmd_watchlist),
         ("stats",          cmd_stats),
+        ("last",           cmd_last),
         ("wallet",         cmd_wallet),
         ("wallet_reset",   cmd_wallet_reset),
         ("blacklist",      cmd_blacklist),
@@ -138,7 +141,7 @@ async def run() -> None:
                 stream(app.bot, engine, market_ctx, state), name="stream"),
             asyncio.create_task(lookback_loop(),         name="lookback"),
             asyncio.create_task(training_loop(engine),   name="training"),
-            asyncio.create_task(paper_monitor_loop(),    name="paper_monitor"),
+            asyncio.create_task(paper_monitor_loop(app.bot), name="paper_monitor"),
             asyncio.create_task(
                 stream_watchdog_loop(app.bot, state),    name="stream_watchdog"),
             asyncio.create_task(

@@ -122,6 +122,144 @@ async def _send_with_fallback(
             raise
 
 
+async def send_trade_opened(
+    bot: Bot, coin: dict, trade: "OpenTrade", state: BotState,
+) -> None:
+    """Notify all chats with paper_reports_enabled and pin the message."""
+    from .config import PUMP_FRONT
+    from .db import db_write
+    from .utils import now_ts
+
+    name   = coin.get("name", "Unknown") or "Unknown"
+    symbol = coin.get("symbol", "???") or "???"
+    mint   = coin.get("mint", "")
+    mc     = trade.entry_mc
+    size   = trade.position_size_usd
+    score  = trade.entry_score
+    prob   = trade.entry_prob
+    sl     = trade.dynamic_sl_pct or 20.0
+    tp     = trade.dynamic_tp_pct or 35.0
+    tsec   = trade.dynamic_time_stop or 14400
+
+    lines = [
+        f"ðŸ" + "‡" + " {mdbold('PAPER TRADE OPENED')}",
+        f"{mdbold(name)} \\({mdcode('$' + symbol)}\\)",
+        "",
+        f"ðŸ" + "’" + " Size: {mdcode(fmt_usd(size, 2))}",
+        f"ðŸ" + "’" + " Entry MC: {mdcode(fmt_usd(mc, 0))}",
+        f"ðŸ" + "“" + " Score: {mdcode(str(score) + '/10')}  "
+        f"Prob: {mdcode(fmt_prob(prob))}",
+        "",
+        f"ðŸ" + "š" + " SL: {mdcode(f'{sl:.1f}%')}  "
+        f"TP: {mdcode(f'{tp:.1f}%')}  "
+        f"Time: {mdcode(fmt_duration(tsec))}",
+    ]
+    if mint:
+        lines.append(f"ðŸ" + "ª™" + " {mdcode(mint)}")
+        lines.append(f"ðŸ" + "”—" + " [Pump\\.fun]({PUMP_FRONT}/{mint})")
+
+    text = "\n".join(lines)
+    kb_rows = [[InlineKeyboardButton("ðŸ" + "”—" + " Open on Pump.fun",
+                                     url=f"{PUMP_FRONT}/{mint}")]] if mint else []
+    kb = InlineKeyboardMarkup(kb_rows) if kb_rows else None
+
+    with closing(db_conn()) as conn:
+        rows = conn.execute(
+            "SELECT chat_id FROM chat_settings WHERE paper_reports_enabled=1"
+        ).fetchall()
+    chats = [int(r["chat_id"]) for r in rows]
+
+    for chat_id in chats:
+        try:
+            sent = await _send_with_fallback(bot, chat_id, text, kb)
+            if sent is not None:
+                try:
+                    await bot.pin_chat_message(
+                        chat_id, sent.message_id, disable_notification=True,
+                    )
+                    def _save_pin(tid=trade.id, cid=chat_id,
+                                  mid=sent.message_id, m=mint):
+                        with closing(db_conn()) as conn, conn:
+                            conn.execute(
+                                "INSERT OR IGNORE INTO pinned_trades"
+                                "(chat_id,message_id,trade_id,mint,pinned_at) "
+                                "VALUES(?,?,?,?,?)",
+                                (cid, mid, tid, m, now_ts()))
+                    db_write(_save_pin)
+                except TelegramError as e:
+                    log.debug("pin trade msg failed %s: %s", chat_id, e)
+        except TelegramError as e:
+            log.error("trade open notify failed %s: %s", chat_id, e)
+
+
+async def send_trade_closed(
+    bot: Bot, trade: "OpenTrade", exit_mc: float, reason: str,
+) -> None:
+    """Notify all chats with paper_reports_enabled about a closed trade."""
+    from .utils import now_ts
+
+    name   = trade.name or "Unknown"
+    symbol = trade.symbol or "???"
+    pnl_usd = (trade.position_size_usd
+               * ((exit_mc * (1 - 0.02) - trade.entry_mc) / trade.entry_mc)
+               if trade.entry_mc > 0 else 0)
+    pnl_pct = ((exit_mc - trade.entry_mc) / trade.entry_mc * 100
+               if trade.entry_mc > 0 else 0)
+
+    sign = "+" if pnl_pct >= 0 else ""
+    arrow = "ðŸ" + "š" + "—" if pnl_pct >= 0 else "ðŸ" + "š" + "“"
+    color = "ðŸ" + "Ÿ" if pnl_pct >= 0 else "ðŸ" + "”"
+
+    lines = [
+        f"{color} {mdbold('PAPER TRADE CLOSED')}",
+        f"{mdbold(name)} \\({mdcode('$' + symbol)}\\)",
+        "",
+        f"{arrow} P&L: {mdcode(f'{sign}{pnl_pct:.1f}%')}  "
+        f"${mdcode(f'{pnl_usd:+.2f}')}",
+        f"ðŸ" + "’”" + " Reason: {mditalic(reason)}",
+        f"ðŸ" + "’" + " Duration: "
+        f"{mdcode(fmt_duration(now_ts() - trade.entry_time))}",
+    ]
+
+    text = "\n".join(lines)
+    kb = None
+
+    with closing(db_conn()) as conn:
+        rows = conn.execute(
+            "SELECT chat_id FROM chat_settings WHERE paper_reports_enabled=1"
+        ).fetchall()
+    chats = [int(r["chat_id"]) for r in rows]
+
+    for chat_id in chats:
+        try:
+            await _send_with_fallback(bot, chat_id, text, kb)
+            # Unpin the corresponding open-trade message
+            try:
+                with closing(db_conn()) as conn:
+                    pin_row = conn.execute(
+                        "SELECT message_id FROM pinned_trades "
+                        "WHERE chat_id=? AND trade_id=?",
+                        (chat_id, trade.id),
+                    ).fetchone()
+                if pin_row:
+                    try:
+                        await bot.unpin_chat_message(
+                            chat_id, pin_row["message_id"])
+                    except TelegramError:
+                        pass
+                    def _del_pin(cid=chat_id, mid=pin_row["message_id"]):
+                        with closing(db_conn()) as conn, conn:
+                            conn.execute(
+                                "DELETE FROM pinned_trades "
+                                "WHERE chat_id=? AND message_id=?",
+                                (cid, mid))
+                    db_write(_del_pin)
+            except Exception:
+                pass
+        except TelegramError as e:
+            log.error("trade close notify failed %s: %s", chat_id, e)
+
+
 async def send_alert(bot: Bot, coin: dict, result: dict, state: BotState) -> None:
     if not state.alerts:
         return

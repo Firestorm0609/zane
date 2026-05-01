@@ -80,7 +80,7 @@ async def process_coin(coin: dict, bot: Bot, engine: ScoringEngine,
                 market_ctx.update(mc, replies)
 
             await loop.run_in_executor(None, save_snapshot, coin)
-            await loop.run_in_executor(None, maybe_close_paper_trades_for_coin, coin)
+            await loop.run_in_executor(None, maybe_close_paper_trades_for_coin, coin, bot)
 
             ok, reason = hard_filter(coin)
             if not ok:
@@ -97,7 +97,7 @@ async def process_coin(coin: dict, bot: Bot, engine: ScoringEngine,
             if creator and mint:
                 await loop.run_in_executor(None, record_creator_token, creator, mint)
 
-            await loop.run_in_executor(None, maybe_open_paper_trade, state, coin, result, market_ctx)
+            await loop.run_in_executor(None, maybe_open_paper_trade, state, coin, result, market_ctx, bot)
             await send_alert(bot, coin, result, state)
 
             await state.mark_seen(mint)

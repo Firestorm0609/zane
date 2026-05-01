@@ -129,6 +129,15 @@ def init_db() -> None:
             PRIMARY KEY (chat_id, message_id)
         );
 
+        CREATE TABLE IF NOT EXISTS pinned_trades (
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            trade_id INTEGER NOT NULL,
+            mint TEXT,
+            pinned_at INTEGER NOT NULL,
+            PRIMARY KEY (chat_id, message_id)
+        );
+
         CREATE TABLE IF NOT EXISTS creator_blacklist (
             creator TEXT PRIMARY KEY,
             reason TEXT,
@@ -189,6 +198,7 @@ def init_db() -> None:
             ("paper_trades", "dynamic_sl_pct", "REAL"),
             ("paper_trades", "dynamic_tp_pct", "REAL"),
             ("paper_trades", "dynamic_time_stop", "INTEGER"),
+            ("chat_settings", "paper_reports_enabled", "INTEGER DEFAULT 0"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")

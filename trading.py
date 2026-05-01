@@ -179,15 +179,17 @@ def open_paper_trade(
     coin: dict, position_size_usd: float = 0.0,
     result: dict | None = None,
     market_ctx: "MarketContext | None" = None,
-) -> bool:
-    """Atomic: deduct balance + insert OPEN trade with dynamic exit params."""
+    bot: "Bot | None" = None,
+) -> "OpenTrade | None":
+    """Atomic: deduct balance + insert OPEN trade with dynamic exit params.
+    Returns the OpenTrade if opened, else None."""
     mint = coin.get("mint", "")
     if not mint or position_size_usd <= 0:
-        return False
+        return None
 
     raw_mc = safe_float(coin.get("usd_market_cap"))
     if raw_mc <= 0:
-        return False
+        return None
     entry_mc  = raw_mc * (1 + PAPER_SLIPPAGE_PCT / 100.0)
     entry_fee = position_size_usd * (PAPER_FEE_PCT / 100.0)
     net_size  = position_size_usd - entry_fee
@@ -204,6 +206,8 @@ def open_paper_trade(
         score = 0
         prob  = 0.0
 
+    trade_row: dict = {}
+
     def _atomic():
         with closing(db_conn()) as conn:
             try:
@@ -214,7 +218,7 @@ def open_paper_trade(
                 bal = safe_float(row["balance_usd"]) if row else 0.0
                 if bal < position_size_usd:
                     conn.execute("ROLLBACK")
-                    return False, "insufficient balance"
+                    return (False, "insufficient balance")
 
                 exists = conn.execute(
                     "SELECT 1 FROM paper_trades WHERE mint=? AND status='OPEN'",
@@ -222,14 +226,14 @@ def open_paper_trade(
                 ).fetchone()
                 if exists:
                     conn.execute("ROLLBACK")
-                    return False, "already open"
+                    return (False, "already open")
 
                 open_count = conn.execute(
                     "SELECT COUNT(*) AS c FROM paper_trades WHERE status='OPEN'"
                 ).fetchone()["c"]
                 if open_count >= PAPER_MAX_CONCURRENT:
                     conn.execute("ROLLBACK")
-                    return False, "max concurrent"
+                    return (False, "max concurrent")
 
                 ts = now_ts()
                 conn.execute("""
@@ -242,29 +246,54 @@ def open_paper_trade(
                       net_size,
                       score, prob, entry_mc, entry_mc,
                       sl, tp, time_sec))
+                trade_row["id"] = conn.execute(
+                    "SELECT last_insert_rowid() AS id"
+                ).fetchone()["id"]
                 conn.execute(
                     "UPDATE paper_wallet SET balance_usd=balance_usd-?, updated_at=? WHERE id=1",
                     (position_size_usd, ts),
                 )
                 conn.execute("COMMIT")
-                return True, "ok"
+                return (True, "ok")
             except Exception as e:
-                try: conn.execute("ROLLBACK")
-                except Exception: pass
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
                 log.error("open_paper_trade tx failed: %s", e)
-                return False, str(e)
+                return (False, str(e))
 
     opened, reason = db_write(_atomic)
     if opened:
         log.info("PAPER OPEN | %s | size=$%.2f fee=$%.2f balance=$%.2f | SL=%.1f%% TP=%.1f%% time=%ds (score=%d prob=%.2f)",
                  name or mint[:8], position_size_usd, entry_fee,
                  PaperWallet.get_balance(), sl, tp, time_sec, score, prob)
+        trade = OpenTrade(
+            id=trade_row.get("id", 0), mint=mint, name=name, symbol=symbol,
+            entry_time=now_ts(), entry_mc=entry_mc,
+            position_size_usd=net_size,
+            entry_score=score, entry_prob=prob,
+            highest_mc=entry_mc, trailing_stop_price=entry_mc,
+            dynamic_sl_pct=sl, dynamic_tp_pct=tp,
+            dynamic_time_stop=time_sec,
+        )
+        # Send notification + pin (best-effort, fire-and-forget)
+        if bot is not None:
+            try:
+                import asyncio
+                from .alerts import send_trade_opened
+                asyncio.ensure_future(
+                    send_trade_opened(bot, coin, trade, None))
+            except Exception as e:
+                log.debug("trade open notify spawn failed: %s", e)
+        return trade
     else:
         log.debug("PAPER open rejected | %s | %s", mint[:8], reason)
-    return opened
+        return None
 
 
-def close_trade(trade: OpenTrade, exit_mc: float, reason: str) -> None:
+def close_trade(trade: OpenTrade, exit_mc: float, reason: str,
+               bot: "Bot | None" = None) -> None:
     """Atomic: close trade row + credit balance in single transaction."""
     effective_exit = (exit_mc * (1 - PAPER_SLIPPAGE_PCT / 100.0)) if exit_mc > 0 else 0
     pnl_pct = (((effective_exit - trade.entry_mc) / trade.entry_mc) * 100
@@ -310,6 +339,15 @@ def close_trade(trade: OpenTrade, exit_mc: float, reason: str) -> None:
         log.info("PAPER CLOSE | %s | %+.2f%% pnl=$%.2f balance=$%.2f | %s",
                  trade.name or trade.mint[:8], pnl_pct, pnl_usd,
                  PaperWallet.get_balance(), reason)
+        # Send close notification (best-effort)
+        if bot is not None:
+            try:
+                import asyncio
+                from .alerts import send_trade_closed
+                asyncio.ensure_future(
+                    send_trade_closed(bot, trade, exit_mc, reason))
+            except Exception as e:
+                log.debug("trade close notify spawn failed: %s", e)
 
 
 # ---------- Dynamic exit parameter computation ----------
@@ -440,7 +478,8 @@ def maybe_auto_blacklist_creator(mint: str) -> None:
 # ---------- Entry helpers ----------
 
 def maybe_open_paper_trade(state: BotState, coin: dict, result: dict,
-                            market_ctx: "MarketContext | None" = None) -> None:
+                            market_ctx: "MarketContext | None" = None,
+                            bot: "Bot | None" = None) -> None:
     ok, reason = paper_entry_allowed(state, coin, result)
     if ok:
         size = calc_position_size(result)
@@ -448,7 +487,7 @@ def maybe_open_paper_trade(state: BotState, coin: dict, result: dict,
             log.debug("PAPER SKIP | %s | size=0", (coin.get("mint") or "?")[:8])
             return
         if open_paper_trade(coin, position_size_usd=size,
-                             result=result, market_ctx=market_ctx):
+                             result=result, market_ctx=market_ctx, bot=bot):
             log.info("PAPER OPEN signal | %s mc=%.2f size=$%.2f",
                      coin.get("name"), safe_float(coin.get("usd_market_cap")), size)
     else:
@@ -593,7 +632,7 @@ def _check_exit_conditions(
     return False, ""
 
 
-def maybe_close_paper_trades_for_coin(coin: dict) -> None:
+def maybe_close_paper_trades_for_coin(coin: dict, bot: "Bot | None" = None) -> None:
     """Evaluate exit conditions for a specific coin using per-trade dynamic params."""
     mint = coin.get("mint", "")
     current_mc = safe_float(coin.get("usd_market_cap"))
@@ -605,10 +644,10 @@ def maybe_close_paper_trades_for_coin(coin: dict) -> None:
         _update_trailing_stop(t, current_mc)
         should_close, reason = _check_exit_conditions(t, current_mc)
         if should_close:
-            close_trade(t, current_mc, reason)
+            close_trade(t, current_mc, reason, bot=bot)
 
 
-async def paper_monitor_loop() -> None:
+async def paper_monitor_loop(bot: "Bot | None" = None) -> None:
     """Monitor open trades using per-trade dynamic exits + trailing stops."""
     while True:
         try:
@@ -622,7 +661,7 @@ async def paper_monitor_loop() -> None:
                             if now_ts() - t.entry_time >= (
                                 t.dynamic_time_stop or PAPER_TIME_STOP_SEC
                             ):
-                                close_trade(t, t.entry_mc, "TIME_STOP_NO_DATA")
+                                close_trade(t, t.entry_mc, "TIME_STOP_NO_DATA", bot=bot)
                             continue
 
                         save_paper_snapshot(t.id, t.mint, mc)
@@ -630,7 +669,7 @@ async def paper_monitor_loop() -> None:
 
                         should_close, reason = _check_exit_conditions(t, mc)
                         if should_close:
-                            close_trade(t, mc, reason)
+                            close_trade(t, mc, reason, bot=bot)
         except Exception as e:
             log.error("paper_monitor_loop: %s", e)
         await asyncio.sleep(PAPER_POLL_INTERVAL_SEC)

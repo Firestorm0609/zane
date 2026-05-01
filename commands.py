@@ -243,6 +243,77 @@ async def cmd_paper_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _reply(update, text_paper_report(_state(ctx)))
 
 
+async def cmd_paper_reports_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Enable pinned trade-open and P&L notifications for this chat."""
+    if not await _check_allowed(update): return
+    from .db import upsert_chat
+    upsert_chat(update.effective_chat.id, paper_reports_enabled=1)
+    await _reply(update, "🟢 Paper trade reports *ON* — you'll get pinned open alerts and P&L close alerts.")
+
+
+async def cmd_paper_reports_off(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Disable paper trade notifications for this chat."""
+    if not await _check_allowed(update): return
+    from .db import upsert_chat
+    upsert_chat(update.effective_chat.id, paper_reports_enabled=0)
+    await _reply(update, "🔴 Paper trade reports *OFF*.")
+
+
+async def cmd_last(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show the most recent paper trade with its current P&L."""
+    if not await _check_allowed(update): return
+    from .trading import get_open_trades
+    from .db import db_conn
+    from .utils import closing, fmt_pct, fmt_usd, mdbold, mdcode, now_ts
+    from .config import PUMP_FRONT
+
+    with closing(db_conn()) as conn:
+        row = conn.execute(
+            "SELECT * FROM paper_trades ORDER BY entry_time DESC LIMIT 1"
+        ).fetchone()
+
+    if not row:
+        await _reply(update, "No trades yet.")
+        return
+
+    name   = row["name"] or "Unknown"
+    symbol = row["symbol"] or "???"
+    mint   = row["mint"]
+    status = row["status"]
+    entry_mc  = float(row["entry_mc"])
+    pnl_pct  = float(row["pnl_pct"] or 0)
+    pnl_usd  = float(row["pnl_usd"] or 0)
+    reason   = row["reason"] or ""
+
+    if status == "OPEN":
+        lines = [
+            f"⚡ {mdbold('MOST RECENT TRADE — OPEN')}",
+            f"{mdbold(name)} \\({mdcode('$' + symbol)}\\)",
+            "",
+            f"💰 Entry MC: {mdcode(fmt_usd(entry_mc, 0))}",
+            f"📊 Size: {mdcode(fmt_usd(float(row['position_size_usd']), 2))}",
+            f"🕐 Opened: {mdcode(fmt_duration(now_ts() - int(row['entry_time'])))} ago",
+        ]
+    else:
+        sign = "+" if pnl_pct >= 0 else ""
+        arrow = "📈" if pnl_pct >= 0 else "📉"
+        lines = [
+            f"{arrow} {mdbold('MOST RECENT TRADE — CLOSED')}",
+            f"{mdbold(name)} \\({mdcode('$' + symbol)}\\)",
+            "",
+            f"{arrow} P&L: {mdcode(f'{sign}{pnl_pct:.1f}%')}  "
+            f"${mdcode(f'{pnl_usd:+.2f}')}",
+            f"📌 Reason: {mdcode(reason)}",
+            f"🕐 Closed: {mdcode(fmt_duration(now_ts() - int(row['exit_time'])))} ago",
+        ]
+
+    if mint:
+        lines.append(f"🪙 {mdcode(mint)}")
+        lines.append(f"🔗 [Pump\\.fun]({PUMP_FRONT}/{mint})")
+
+    await _reply(update, "\n".join(lines))
+
+
 # ---------- Diagnostics ----------
 
 async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

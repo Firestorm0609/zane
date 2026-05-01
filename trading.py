@@ -41,6 +41,14 @@ class OpenTrade:
     entry_time: int
     entry_mc: float
     position_size_usd: float
+    # Dynamic exit parameters computed at entry
+    entry_score: int = 0
+    entry_prob: float = 0.0
+    highest_mc: float = 0.0
+    trailing_stop_price: float = 0.0
+    dynamic_sl_pct: float = 0.0
+    dynamic_tp_pct: float = 0.0
+    dynamic_time_stop: int = 0
 
 
 def get_open_trades() -> list[OpenTrade]:
@@ -50,8 +58,17 @@ def get_open_trades() -> list[OpenTrade]:
         ).fetchall()
     return [
         OpenTrade(
-            int(r["id"]), r["mint"], r["name"] or "", r["symbol"] or "",
-            int(r["entry_time"]), float(r["entry_mc"]), float(r["position_size_usd"]),
+            id=int(r["id"]), mint=r["mint"], name=r["name"] or "",
+            symbol=r["symbol"] or "", entry_time=int(r["entry_time"]),
+            entry_mc=float(r["entry_mc"]),
+            position_size_usd=float(r["position_size_usd"]),
+            entry_score=int(r["entry_score"] or 0),
+            entry_prob=float(r["entry_prob"] or 0.0),
+            highest_mc=float(r["highest_mc"] or r["entry_mc"]),
+            trailing_stop_price=float(r["trailing_stop_price"] or r["entry_mc"]),
+            dynamic_sl_pct=float(r["dynamic_sl_pct"] or 0.0),
+            dynamic_tp_pct=float(r["dynamic_tp_pct"] or 0.0),
+            dynamic_time_stop=int(r["dynamic_time_stop"] or 0),
         )
         for r in rows
     ]
@@ -158,8 +175,12 @@ def paper_entry_allowed(state: BotState, coin: dict, result: dict) -> tuple[bool
     return True, "ok"
 
 
-def open_paper_trade(coin: dict, position_size_usd: float = 0.0) -> bool:
-    """Atomic: deduct balance + insert OPEN trade in single transaction."""
+def open_paper_trade(
+    coin: dict, position_size_usd: float = 0.0,
+    result: dict | None = None,
+    market_ctx: "MarketContext | None" = None,
+) -> bool:
+    """Atomic: deduct balance + insert OPEN trade with dynamic exit params."""
     mint = coin.get("mint", "")
     if not mint or position_size_usd <= 0:
         return False
@@ -172,6 +193,16 @@ def open_paper_trade(coin: dict, position_size_usd: float = 0.0) -> bool:
     net_size  = position_size_usd - entry_fee
     name      = coin.get("name", "")
     symbol    = coin.get("symbol", "")
+
+    # Compute dynamic exit parameters for this specific trade
+    if result is not None:
+        sl, tp, time_sec = compute_dynamic_exit_params(coin, result, market_ctx)
+        score = safe_int(result.get("score", 0))
+        prob  = safe_float(result.get("probability", 0.0))
+    else:
+        sl, tp, time_sec = PAPER_STOP_LOSS_PCT, PAPER_TAKE_PROFIT_PCT, PAPER_TIME_STOP_SEC
+        score = 0
+        prob  = 0.0
 
     def _atomic():
         with closing(db_conn()) as conn:
@@ -200,14 +231,20 @@ def open_paper_trade(coin: dict, position_size_usd: float = 0.0) -> bool:
                     conn.execute("ROLLBACK")
                     return False, "max concurrent"
 
+                ts = now_ts()
                 conn.execute("""
                     INSERT INTO paper_trades
-                        (mint,name,symbol,entry_time,entry_mc,status,position_size_usd)
-                    VALUES (?,?,?,?,?,'OPEN',?)
-                """, (mint, name, symbol, now_ts(), entry_mc, net_size))
+                        (mint,name,symbol,entry_time,entry_mc,status,position_size_usd,
+                         entry_score,entry_prob,highest_mc,trailing_stop_price,
+                         dynamic_sl_pct,dynamic_tp_pct,dynamic_time_stop)
+                    VALUES (?,?,?,?,?,'OPEN',?,?,?,?,?,?,?,?)
+                """, (mint, name, symbol, ts, entry_mc,
+                      net_size,
+                      score, prob, entry_mc, entry_mc,
+                      sl, tp, time_sec))
                 conn.execute(
                     "UPDATE paper_wallet SET balance_usd=balance_usd-?, updated_at=? WHERE id=1",
-                    (position_size_usd, now_ts()),
+                    (position_size_usd, ts),
                 )
                 conn.execute("COMMIT")
                 return True, "ok"
@@ -219,9 +256,9 @@ def open_paper_trade(coin: dict, position_size_usd: float = 0.0) -> bool:
 
     opened, reason = db_write(_atomic)
     if opened:
-        log.info("PAPER OPEN | %s | size=$%.2f fee=$%.2f balance=$%.2f",
+        log.info("PAPER OPEN | %s | size=$%.2f fee=$%.2f balance=$%.2f | SL=%.1f%% TP=%.1f%% time=%ds (score=%d prob=%.2f)",
                  name or mint[:8], position_size_usd, entry_fee,
-                 PaperWallet.get_balance())
+                 PaperWallet.get_balance(), sl, tp, time_sec, score, prob)
     else:
         log.debug("PAPER open rejected | %s | %s", mint[:8], reason)
     return opened
@@ -275,6 +312,84 @@ def close_trade(trade: OpenTrade, exit_mc: float, reason: str) -> None:
                  PaperWallet.get_balance(), reason)
 
 
+# ---------- Dynamic exit parameter computation ----------
+
+def compute_dynamic_exit_params(
+    coin: dict,
+    result: dict,
+    market_ctx: "MarketContext | None" = None,
+) -> tuple[float, float, int]:
+    """Compute per-trade SL%, TP%, and time-stop seconds from coin features.
+
+    Decisions are based on:
+      - Score / probability (high confidence → wider TP, tighter SL)
+      - Market-cap percentile (late entries get tighter parameters)
+      - Coin age (fresh coins get more room)
+      - Reply momentum (high engagement → longer time, wider TP)
+      - Recent market volatility (not yet available at signal time — default)
+    Returns (sl_pct, tp_pct, time_stop_sec).
+    """
+    score = safe_int(result.get("score", 0))
+    prob  = safe_float(result.get("probability", 0.0))
+    mc    = safe_float(coin.get("usd_market_cap"))
+    replies = safe_int(coin.get("reply_count", 0))
+
+    # --- Base values from config (used as anchors) ---
+    base_sl = PAPER_STOP_LOSS_PCT
+    base_tp = PAPER_TAKE_PROFIT_PCT
+    base_time = PAPER_TIME_STOP_SEC
+
+    # --- Score/prob scaling ---
+    # Score 10 → TP +80%, SL -30%.  Score 5 → TP -40%, SL +20%
+    score_factor = (score - 5) / 5.0  # -1.0 … +1.0
+    prob_factor  = (prob - 0.5) * 2.0  # -1.0 … +1.0
+    confidence   = max(-1.0, min(1.0, 0.6 * score_factor + 0.4 * prob_factor))
+
+    # --- MC percentile: later entries in the distribution get tighter exits ---
+    mc_pct = 0.5
+    if market_ctx is not None:
+        try:
+            mc_pct = market_ctx.percentile_mc(mc)
+        except Exception:
+            pass
+    # High percentile (>0.8) → tighter TP, tighter time. Low → more room.
+    mc_factor = 1.0 - (mc_pct - 0.5) * 1.0  # 0.5→1.0, 1.0→0.5
+
+    # --- Coin age: fresh coins are more volatile → wider exit bands ---
+    created_raw = coin.get("created_timestamp")
+    age_factor = 1.0
+    if created_raw:
+        created_ts = safe_int(created_raw)
+        if created_ts > 1_000_000_000_000:
+            created_ts //= 1000
+        age_sec = now_ts() - created_ts
+        # <30 min → 1.4x room.  >2 hr → 0.8x room.
+        age_factor = max(0.6, min(1.4, 1.4 - (age_sec / 7200.0) * 0.6))
+
+    # --- Reply momentum: high engagement → give more time/room ---
+    mc_k = max(mc, 1.0)
+    replies_per_kmc = replies / (mc_k / 1000.0)
+    engagement_factor = max(0.6, min(1.4, 0.8 + (replies_per_kmc / 50.0) * 0.6))
+
+    # --- Compute SL ---
+    # High confidence → tighter SL (we trust the signal more).
+    sl = base_sl * (1.0 + 0.3 * confidence) * mc_factor * age_factor
+    sl = max(base_sl * 0.3, min(base_sl * 1.5, sl))
+
+    # --- Compute TP ---
+    # High confidence → wider TP. Low confidence → tight TP.
+    tp = base_tp * (1.0 + 0.8 * confidence) * mc_factor * engagement_factor
+    tp = max(base_tp * 0.5, min(base_tp * 2.5, tp))
+
+    # --- Compute time stop ---
+    # High engagement + high confidence → more time to run.
+    # High MC percentile (late entry) → less time.
+    time_mult = (1.0 + 0.5 * confidence) * mc_factor * engagement_factor
+    time_sec = int(base_time * max(0.3, min(2.5, time_mult)))
+
+    return round(sl, 1), round(tp, 1), time_sec
+
+
 # ---------- Creator history / auto-blacklist ----------
 
 def record_creator_token(creator: str, mint: str) -> None:
@@ -324,14 +439,16 @@ def maybe_auto_blacklist_creator(mint: str) -> None:
 
 # ---------- Entry helpers ----------
 
-def maybe_open_paper_trade(state: BotState, coin: dict, result: dict) -> None:
+def maybe_open_paper_trade(state: BotState, coin: dict, result: dict,
+                            market_ctx: "MarketContext | None" = None) -> None:
     ok, reason = paper_entry_allowed(state, coin, result)
     if ok:
         size = calc_position_size(result)
         if size <= 0:
             log.debug("PAPER SKIP | %s | size=0", (coin.get("mint") or "?")[:8])
             return
-        if open_paper_trade(coin, position_size_usd=size):
+        if open_paper_trade(coin, position_size_usd=size,
+                             result=result, market_ctx=market_ctx):
             log.info("PAPER OPEN signal | %s mc=%.2f size=$%.2f",
                      coin.get("name"), safe_float(coin.get("usd_market_cap")), size)
     else:
@@ -414,52 +531,106 @@ def adaptive_sl_tp() -> tuple[float, float]:
     return sl, tp
 
 
+def _update_trailing_stop(trade: OpenTrade, current_mc: float) -> None:
+    """Raise trailing stop when price moves in-the-money.
+
+    Trail distance = dynamic_sl_pct% below the highest MC seen.
+    Persists highest_mc and trailing_stop_price to DB.
+    """
+    if current_mc <= 0:
+        return
+    if current_mc > trade.highest_mc:
+        trade.highest_mc = current_mc
+        sl_pct = trade.dynamic_sl_pct or PAPER_STOP_LOSS_PCT
+        trade.trailing_stop_price = current_mc * (1.0 - sl_pct / 100.0)
+        def _w():
+            with closing(db_conn()) as conn, conn:
+                conn.execute(
+                    "UPDATE paper_trades SET highest_mc=?, trailing_stop_price=? "
+                    "WHERE id=? AND status='OPEN'",
+                    (trade.highest_mc, trade.trailing_stop_price, trade.id),
+                )
+        db_write(_w)
+
+
+def _check_exit_conditions(
+    trade: OpenTrade, current_mc: float,
+) -> tuple[bool, str]:
+    """Evaluate all exit conditions for a trade given current MC.
+
+    Priority: hard SL > trailing stop > TP > time stop.
+    Uses per-trade dynamic params; falls back to adaptive_params().
+    """
+    sl_pct   = trade.dynamic_sl_pct   or PAPER_STOP_LOSS_PCT
+    tp_pct   = trade.dynamic_tp_pct   or PAPER_TAKE_PROFIT_PCT
+    time_sec = trade.dynamic_time_stop or PAPER_TIME_STOP_SEC
+
+    if trade.entry_mc <= 0:
+        return False, ""
+
+    pnl_pct = ((current_mc - trade.entry_mc) / trade.entry_mc) * 100.0
+    age_sec  = now_ts() - trade.entry_time
+
+    # 1. Hard stop-loss (from entry)
+    if current_mc <= trade.entry_mc * (1.0 - sl_pct / 100.0):
+        return True, f"STOP_LOSS_{sl_pct:.1f}%"
+
+    # 2. Trailing stop (only active when in profit)
+    if trade.highest_mc > trade.entry_mc and trade.trailing_stop_price > 0:
+        if current_mc <= trade.trailing_stop_price:
+            trail_pnl = ((trade.trailing_stop_price - trade.entry_mc)
+                        / trade.entry_mc) * 100.0
+            return True, f"TRAILING_STOP_{trail_pnl:+.1f}%"
+
+    # 3. Take profit
+    if pnl_pct >= abs(tp_pct):
+        return True, f"TAKE_PROFIT_{tp_pct:.1f}%"
+
+    # 4. Time stop
+    if age_sec >= time_sec:
+        return True, f"TIME_STOP_{time_sec}s"
+
+    return False, ""
+
+
 def maybe_close_paper_trades_for_coin(coin: dict) -> None:
+    """Evaluate exit conditions for a specific coin using per-trade dynamic params."""
     mint = coin.get("mint", "")
     current_mc = safe_float(coin.get("usd_market_cap"))
     if not mint or current_mc <= 0:
         return
-    sl_pct, tp_pct, time_sec = adaptive_params()
     for t in get_open_trades():
         if t.mint != mint:
             continue
-        pnl_pct = (((current_mc - t.entry_mc) / t.entry_mc) * 100
-                   if t.entry_mc > 0 else 0.0)
-        age_sec = now_ts() - t.entry_time
-        if pnl_pct <= -abs(sl_pct):
-            close_trade(t, current_mc, f"STOP_LOSS_{sl_pct:.1f}%")
-        elif pnl_pct >= abs(tp_pct):
-            close_trade(t, current_mc, f"TAKE_PROFIT_{tp_pct:.1f}%")
-        elif age_sec >= time_sec:
-            close_trade(t, current_mc, f"TIME_STOP_{time_sec}s")
+        _update_trailing_stop(t, current_mc)
+        should_close, reason = _check_exit_conditions(t, current_mc)
+        if should_close:
+            close_trade(t, current_mc, reason)
 
 
 async def paper_monitor_loop() -> None:
+    """Monitor open trades using per-trade dynamic exits + trailing stops."""
     while True:
         try:
             trades = get_open_trades()
             if trades:
-                sl_pct, tp_pct, time_sec = adaptive_params()
                 async with aiohttp.ClientSession() as session:
                     for t in trades:
                         mc = await fetch_coin_mc(session, t.mint)
                         if mc is None:
-                            if now_ts() - t.entry_time >= time_sec:
+                            # No data — close only if time stop has passed
+                            if now_ts() - t.entry_time >= (
+                                t.dynamic_time_stop or PAPER_TIME_STOP_SEC
+                            ):
                                 close_trade(t, t.entry_mc, "TIME_STOP_NO_DATA")
                             continue
 
                         save_paper_snapshot(t.id, t.mint, mc)
+                        _update_trailing_stop(t, mc)
 
-                        pnl_pct = (((mc - t.entry_mc) / t.entry_mc) * 100
-                                   if t.entry_mc > 0 else 0.0)
-                        age_sec = now_ts() - t.entry_time
-
-                        if pnl_pct <= -abs(sl_pct):
-                            close_trade(t, mc, f"STOP_LOSS_{sl_pct:.1f}%")
-                        elif pnl_pct >= abs(tp_pct):
-                            close_trade(t, mc, f"TAKE_PROFIT_{tp_pct:.1f}%")
-                        elif age_sec >= time_sec:
-                            close_trade(t, mc, f"TIME_STOP_{time_sec}s")
+                        should_close, reason = _check_exit_conditions(t, mc)
+                        if should_close:
+                            close_trade(t, mc, reason)
         except Exception as e:
             log.error("paper_monitor_loop: %s", e)
         await asyncio.sleep(PAPER_POLL_INTERVAL_SEC)

@@ -15,7 +15,7 @@ from .db import db_conn, get_state
 from .market import MarketContext
 from .scoring import ScoringEngine
 from .state import BotState
-from .trading import adaptive_params, adaptive_sl_tp, paper_stats
+from .trading import get_open_trades, paper_stats
 from .utils import (
     REC_EMOJI, fmt_duration, fmt_pct, fmt_prob, fmt_usd,
     mdbold, mdcode, mditalic, now_ts, safe_float, safe_int, score_emoji,
@@ -280,18 +280,20 @@ def text_paper_status(state: BotState) -> str:
     s = paper_stats()
     s["paper_enabled"] = state.paper_enabled
     status = "ON" if s["paper_enabled"] else "OFF"
-    live_sl, live_tp, live_time = adaptive_params()
-    is_adapted = (
-        live_sl != PAPER_STOP_LOSS_PCT
-        or live_tp != PAPER_TAKE_PROFIT_PCT
-        or live_time != PAPER_TIME_STOP_SEC
-    )
-    adapt_note = " \\(adaptive\\)" if is_adapted else ""
+    trades = get_open_trades()
+    if trades:
+        avg_sl   = sum(t.dynamic_sl_pct   or PAPER_STOP_LOSS_PCT   for t in trades) / len(trades)
+        avg_tp   = sum(t.dynamic_tp_pct   or PAPER_TAKE_PROFIT_PCT for t in trades) / len(trades)
+        avg_time = sum(t.dynamic_time_stop or PAPER_TIME_STOP_SEC for t in trades) / len(trades)
+        dyn_note = mditalic("(dynamic/per-trade)")
+    else:
+        avg_sl, avg_tp, avg_time = PAPER_STOP_LOSS_PCT, PAPER_TAKE_PROFIT_PCT, PAPER_TIME_STOP_SEC
+        dyn_note = mditalic("(global defaults)")
     return (
         f"📋 {mdbold('Paper:')} {mdbold(status)}\n"
-        f"SL {mdcode(f'-{live_sl:.1f}%')} \\| "
-        f"TP {mdcode(f'+{live_tp:.1f}%')} \\| "
-        f"Time {mdcode(f'{live_time}s')}{adapt_note}\n\n"
+        f"SL {mdcode(f'-{avg_sl:.1f}%')} \\| "
+        f"TP {mdcode(f'+{avg_tp:.1f}%')} \\| "
+        f"Time {mdcode(fmt_duration(avg_time))} {dyn_note}\n\n"
         f"Open {mdcode(s['open_positions'])} \\| "
         f"Closed {mdcode(s['closed_positions'])}\n"
         f"Win rate {mdcode(str(round(s['win_rate'],1))+'%')} \\| "
@@ -374,8 +376,9 @@ def text_paper_report(state: BotState) -> str:
     if not open_trades:
         lines.append(mditalic("None."))
     else:
-        sl_pct, tp_pct = adaptive_sl_tp()
-        lines.append(mditalic(f"SL {sl_pct:.1f}% \\(adaptive\\) TP {tp_pct:.1f}% \\(adaptive\\)"))
+        # Show per-trade dynamic exit parameters
+        trades_objs = get_open_trades()
+        trade_map = {t.mint: t for t in trades_objs}
         for t in open_trades:
             name     = t["name"] or t["symbol"] or (t["mint"] or "?")[:6]
             entry_mc = safe_float(t["entry_mc"])
@@ -387,11 +390,23 @@ def text_paper_report(state: BotState) -> str:
                 unreal = ((safe_float(cur_mc) - entry_mc) / entry_mc) * 100
                 e = "🟢" if unreal > 0 else ("🔴" if unreal < 0 else "⚪")
                 unreal_str = f" {e} {mdcode(fmt_pct(unreal, 1, signed=True))}"
+
+            # Per-trade dynamic exit info
+            obj = trade_map.get(t["mint"])
+            if obj:
+                sl   = obj.dynamic_sl_pct   or PAPER_STOP_LOSS_PCT
+                tp   = obj.dynamic_tp_pct   or PAPER_TAKE_PROFIT_PCT
+                tsec = obj.dynamic_time_stop or PAPER_TIME_STOP_SEC
+                dyn  = mditalic(f"SL {sl:.1f}% TP {tp:.1f}% time {fmt_duration(tsec)}")
+            else:
+                dyn  = mditalic("(no dynamic params)")
+
             lines.append(
                 f"• {mdbold(name)} "
                 f"entry {mdcode(fmt_usd(entry_mc))} \\| "
                 f"age {mdcode(fmt_duration(age_sec))} \\| "
-                f"size {mdcode(fmt_usd(size))}{unreal_str}"
+                f"size {mdcode(fmt_usd(size))}{unreal_str}\n"
+                f"  {dyn}"
             )
 
     lines += ["", mdbold("🕒 Last 15 Trades")]

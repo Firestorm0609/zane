@@ -76,7 +76,11 @@ def init_db() -> None:
             entry_time INTEGER NOT NULL, entry_mc REAL NOT NULL,
             exit_time INTEGER, exit_mc REAL,
             pnl_pct REAL, pnl_usd REAL, reason TEXT,
-            status TEXT NOT NULL, position_size_usd REAL NOT NULL
+            status TEXT NOT NULL, position_size_usd REAL NOT NULL,
+            entry_score INTEGER, entry_prob REAL,
+            highest_mc REAL, trailing_stop_price REAL,
+            dynamic_sl_pct REAL, dynamic_tp_pct REAL,
+            dynamic_time_stop INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS paper_mc_snapshots (
@@ -178,6 +182,13 @@ def init_db() -> None:
             ("signals",      "scoring_mode",   "TEXT"),
             ("dead_letters", "retry_count",    "INTEGER DEFAULT 0"),
             ("dead_letters", "last_retry_at",  "INTEGER"),
+            ("paper_trades", "entry_score",    "INTEGER"),
+            ("paper_trades", "entry_prob",     "REAL"),
+            ("paper_trades", "highest_mc",     "REAL"),
+            ("paper_trades", "trailing_stop_price", "REAL"),
+            ("paper_trades", "dynamic_sl_pct", "REAL"),
+            ("paper_trades", "dynamic_tp_pct", "REAL"),
+            ("paper_trades", "dynamic_time_stop", "INTEGER"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")

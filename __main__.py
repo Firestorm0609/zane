@@ -24,6 +24,7 @@ from .commands import (
     cmd_scoring_mode, cmd_set_threshold, cmd_snapshot, cmd_start,
     cmd_stats, cmd_top, cmd_train, cmd_unwatch, cmd_wallet,
     cmd_wallet_reset, cmd_watch, cmd_watchlist,
+    cmd_last, cmd_paper_reports_on, cmd_paper_reports_off,
 )
 from .keywords import KeywordModel
 from .lookback import lookback_loop, train_executor, training_loop

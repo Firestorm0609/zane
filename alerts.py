@@ -15,7 +15,7 @@ from .db import db_conn, db_write, upsert_chat
 from .state import BotState
 from .utils import (
     REC_EMOJI, fmt_prob, fmt_usd, mdbold, mdcode, mditalic,
-    now_ts, safe_float, safe_int, score_emoji, strip_md2, validate_url,
+    now_ts, safe_float, safe_int, score_emoji, strip_md2, validate_url, fmt_duration,
 )
 
 log = logging.getLogger(__name__)

@@ -216,7 +216,7 @@ async def send_trade_closed(
         "",
         f"{arrow} P&L: {mdcode(f'{sign}{pnl_pct:.1f}%')}  "
         f"${mdcode(f'{pnl_usd:+.2f}')}",
-        f"ðŸ" + "’”" + " Reason: {mditalic(reason)}",
+        f"ðŸ" + "’”" + f" Reason: {mditalic(reason)}",
         f"ðŸ" + "’" + " Duration: "
         f"{mdcode(fmt_duration(now_ts() - trade.entry_time))}",
     ]

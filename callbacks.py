@@ -26,6 +26,19 @@ log = logging.getLogger(__name__)
 PM = "MarkdownV2"
 
 
+def _paper_report_kb(page: int, total_pages: int) -> InlineKeyboardMarkup:
+    """Navigation keyboard for the paginated paper report."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"paper_report_page_{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("Next ▶", callback_data=f"paper_report_page_{page + 1}"))
+    rows = [nav] if nav else []
+    rows.append([InlineKeyboardButton("⬅ Back", callback_data="menu")])
+    return InlineKeyboardMarkup(rows)
+
+
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     try:
@@ -153,7 +166,19 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await show(f"❌ {mdbold('Paper trading OFF')}")
 
         elif data == "paper_status": await show(text_paper_status(state))
-        elif data == "paper_report": await show(text_paper_report(state))
+        elif data == "paper_report":
+            text, total_pages = text_paper_report(state, page=0)
+            kb = _paper_report_kb(0, total_pages)
+            await show(text, kb=kb)
+
+        elif data.startswith("paper_report_page_"):
+            try:
+                page = int(data.split("_")[-1])
+            except ValueError:
+                page = 0
+            text, total_pages = text_paper_report(state, page=page)
+            kb = _paper_report_kb(page, total_pages)
+            await show(text, kb=kb)
 
         else:
             try:

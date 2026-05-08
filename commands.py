@@ -240,7 +240,8 @@ async def cmd_paper_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_paper_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await _check_allowed(update): return
-    await _reply(update, text_paper_report(_state(ctx)))
+    text, _ = text_paper_report(_state(ctx))
+    await _reply(update, text)
 
 
 async def cmd_paper_reports_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

@@ -303,15 +303,26 @@ def text_paper_status(state: BotState) -> str:
     )
 
 
-def text_paper_report(state: BotState) -> str:
+PAPER_REPORT_TRADES_PER_PAGE = 5
+
+
+def text_paper_report(state: BotState, page: int = 0) -> str:
     s = paper_stats()
     s["paper_enabled"] = state.paper_enabled
 
+    trades_per_page = PAPER_REPORT_TRADES_PER_PAGE
+    trade_offset = page * trades_per_page
+
     with closing(db_conn()) as conn:
+        total_closed = conn.execute(
+            "SELECT COUNT(*) AS c FROM paper_trades WHERE status='CLOSED'"
+        ).fetchone()["c"]
         recent = conn.execute(
             "SELECT mint, name, symbol, entry_mc, exit_mc, entry_time, exit_time, "
             "pnl_pct, pnl_usd, reason, position_size_usd "
-            "FROM paper_trades WHERE status='CLOSED' ORDER BY exit_time DESC LIMIT 15"
+            "FROM paper_trades WHERE status='CLOSED' ORDER BY exit_time DESC "
+            "LIMIT ? OFFSET ?",
+            (trades_per_page, trade_offset),
         ).fetchall()
         open_trades = conn.execute("""
             SELECT t.mint, t.name, t.symbol, t.entry_mc, t.entry_time,
@@ -409,7 +420,13 @@ def text_paper_report(state: BotState) -> str:
                 f"  {dyn}"
             )
 
-    lines += ["", mdbold("🕒 Last 15 Trades")]
+    total_pages = max(1, (total_closed + trades_per_page - 1) // trades_per_page)
+    page = max(0, min(page, total_pages - 1))  # clamp
+    trades_label = (
+        f"🕒 Recent Trades "
+        f"\\(page {page + 1}/{total_pages}\\)"
+    )
+    lines += ["", mdbold(trades_label)]
     if not recent:
         lines.append(mditalic("No closed trades yet."))
     else:
@@ -444,7 +461,7 @@ def text_paper_report(state: BotState) -> str:
             if line2:
                 lines.append(line2)
 
-    return "\n".join(lines)
+    return "\n".join(lines), total_pages
 
 
 # ---------- Stats / wallet / top ----------

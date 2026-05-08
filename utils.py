@@ -75,9 +75,13 @@ def fmt_usd(val, places: int = 0, signed: bool = False) -> str:
 
 def fmt_duration(seconds: int) -> str:
     if seconds <= 0:
-        return "0m"
+        return "0s"
+    if seconds < 60:
+        return f"{seconds}s"
     if seconds < 3600:
-        return f"{seconds // 60}m"
+        m = seconds // 60
+        s = seconds % 60
+        return f"{m}m{s:02d}s" if s else f"{m}m"
     h = seconds // 3600
     m = (seconds % 3600) // 60
     return f"{h}h{m:02d}m" if m else f"{h}h"

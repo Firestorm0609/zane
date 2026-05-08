@@ -97,7 +97,8 @@ async def process_coin(coin: dict, bot: Bot, engine: ScoringEngine,
             if creator and mint:
                 await loop.run_in_executor(None, record_creator_token, creator, mint)
 
-            await loop.run_in_executor(None, maybe_open_paper_trade, state, coin, result, market_ctx, bot)
+            await loop.run_in_executor(
+                None, maybe_open_paper_trade, state, coin, result, market_ctx, bot, loop)
             await send_alert(bot, coin, result, state)
 
             await state.mark_seen(mint)

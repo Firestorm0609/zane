@@ -180,6 +180,7 @@ def open_paper_trade(
     result: dict | None = None,
     market_ctx: "MarketContext | None" = None,
     bot: "Bot | None" = None,
+    event_loop=None,
 ) -> "OpenTrade | None":
     """Atomic: deduct balance + insert OPEN trade with dynamic exit params.
     Returns the OpenTrade if opened, else None."""
@@ -284,11 +285,21 @@ def open_paper_trade(
                 import asyncio
                 from .alerts import send_trade_opened
                 coro = send_trade_opened(bot, coin, trade, None)
-                asyncio.get_event_loop().create_task(coro)
+                if event_loop is not None and event_loop.is_running():
+                    asyncio.run_coroutine_threadsafe(coro, event_loop)
+                    coro = None  # future owns it now
+                else:
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(coro)
+                        coro = None
+                    except RuntimeError:
+                        pass
             except Exception as e:
+                log.debug("trade open notify spawn failed: %s", e)
+            finally:
                 if coro is not None:
                     coro.close()
-                log.debug("trade open notify spawn failed: %s", e)
         return trade
     else:
         log.debug("PAPER open rejected | %s | %s", mint[:8], reason)
@@ -349,11 +360,18 @@ def close_trade(trade: OpenTrade, exit_mc: float, reason: str,
                 import asyncio
                 from .alerts import send_trade_closed
                 coro = send_trade_closed(bot, trade, exit_mc, reason)
-                asyncio.get_event_loop().create_task(coro)
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                if loop and loop.is_running():
+                    loop.create_task(coro)
+                    coro = None  # loop owns it now
             except Exception as e:
+                log.debug("trade close notify spawn failed: %s", e)
+            finally:
                 if coro is not None:
                     coro.close()
-                log.debug("trade close notify spawn failed: %s", e)
 
 
 # ---------- Dynamic exit parameter computation ----------
@@ -485,7 +503,8 @@ def maybe_auto_blacklist_creator(mint: str) -> None:
 
 def maybe_open_paper_trade(state: BotState, coin: dict, result: dict,
                             market_ctx: "MarketContext | None" = None,
-                            bot: "Bot | None" = None) -> None:
+                            bot: "Bot | None" = None,
+                            event_loop=None) -> None:
     ok, reason = paper_entry_allowed(state, coin, result)
     if ok:
         size = calc_position_size(result)
@@ -493,7 +512,8 @@ def maybe_open_paper_trade(state: BotState, coin: dict, result: dict,
             log.debug("PAPER SKIP | %s | size=0", (coin.get("mint") or "?")[:8])
             return
         if open_paper_trade(coin, position_size_usd=size,
-                             result=result, market_ctx=market_ctx, bot=bot):
+                             result=result, market_ctx=market_ctx, bot=bot,
+                             event_loop=event_loop):
             log.info("PAPER OPEN signal | %s mc=%.2f size=$%.2f",
                      coin.get("name"), safe_float(coin.get("usd_market_cap")), size)
     else:

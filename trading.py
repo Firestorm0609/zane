@@ -279,12 +279,15 @@ def open_paper_trade(
         )
         # Send notification + pin (best-effort, fire-and-forget)
         if bot is not None:
+            coro = None
             try:
                 import asyncio
                 from .alerts import send_trade_opened
-                asyncio.ensure_future(
-                    send_trade_opened(bot, coin, trade, None))
+                coro = send_trade_opened(bot, coin, trade, None)
+                asyncio.get_event_loop().create_task(coro)
             except Exception as e:
+                if coro is not None:
+                    coro.close()
                 log.debug("trade open notify spawn failed: %s", e)
         return trade
     else:
@@ -341,12 +344,15 @@ def close_trade(trade: OpenTrade, exit_mc: float, reason: str,
                  PaperWallet.get_balance(), reason)
         # Send close notification (best-effort)
         if bot is not None:
+            coro = None
             try:
                 import asyncio
                 from .alerts import send_trade_closed
-                asyncio.ensure_future(
-                    send_trade_closed(bot, trade, exit_mc, reason))
+                coro = send_trade_closed(bot, trade, exit_mc, reason)
+                asyncio.get_event_loop().create_task(coro)
             except Exception as e:
+                if coro is not None:
+                    coro.close()
                 log.debug("trade close notify spawn failed: %s", e)
 
 

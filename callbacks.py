@@ -62,6 +62,9 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     async def show(text: str, kb=None):
         target_kb = kb or back_keyboard()
+        # Telegram hard limit for editMessageText is 4096 chars
+        if len(text) > 4096:
+            text = text[:4090] + "\n…"
         try:
             await query.edit_message_text(text, parse_mode=PM, reply_markup=target_kb)
         except BadRequest as e:

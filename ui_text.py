@@ -340,6 +340,27 @@ def text_paper_report(state: BotState, page: int = 0) -> str:
             "GROUP BY reason ORDER BY cnt DESC"
         ).fetchall()
 
+    # Group reasons by base type (e.g. TAKE_PROFIT_23.4% -> TAKE_PROFIT)
+    import re as _re
+    _grouped: dict = {}
+    for r in reason_stats:
+        raw = r["reason"] or "unknown"
+        base = _re.sub(r'[_\-]?\d+\.?\d*%?$', '', raw).rstrip('_- ') or raw
+        if base not in _grouped:
+            _grouped[base] = {"cnt": 0, "pnl_sum": 0.0, "usd_sum": 0.0, "variants": 0}
+        g = _grouped[base]
+        cnt = safe_int(r["cnt"])
+        g["cnt"] += cnt
+        if r["avg_pct"] is not None:
+            g["pnl_sum"] += (r["avg_pct"] or 0) * cnt
+        if r["total_usd"] is not None:
+            g["usd_sum"] += r["total_usd"] or 0
+        g["variants"] += 1
+    # Sort grouped by count desc, cap at 8
+    _grouped_sorted = sorted(_grouped.items(), key=lambda x: x[1]["cnt"], reverse=True)
+    _show_reasons = _grouped_sorted[:8]
+    _hidden = len(_grouped_sorted) - len(_show_reasons)
+
     ts_now  = now_ts()
     enabled = s["paper_enabled"]
     status  = "ON ✅" if enabled else "OFF ⛔"
@@ -367,21 +388,23 @@ def text_paper_report(state: BotState, page: int = 0) -> str:
             f"Max DD {mdcode(fmt_usd(s['max_drawdown_usd'], 2))}",
         ]
 
-    if reason_stats:
+    if _show_reasons:
         lines += ["", mdbold("🎯 Exit Reasons")]
-        for r in reason_stats:
-            reason    = r["reason"] or "unknown"
-            cnt       = safe_int(r["cnt"])
-            avg_pct   = r["avg_pct"]
-            total_usd = r["total_usd"]
-            pct_str = fmt_pct(avg_pct, 1, signed=True) if avg_pct is not None else "—"
-            usd_str = fmt_usd(total_usd, 2, signed=True) if total_usd is not None else "—"
+        for base, g in _show_reasons:
+            cnt       = g["cnt"]
+            avg_pct   = g["pnl_sum"] / cnt if cnt else 0
+            total_usd = g["usd_sum"]
+            pct_str   = fmt_pct(avg_pct, 1, signed=True)
+            usd_str   = fmt_usd(total_usd, 2, signed=True)
+            label     = base if g["variants"] == 1 else f"{base} \\(×{g['variants']}\\)"
             lines.append(
-                f"• {mdcode(reason)} "
+                f"• {mdcode(label)} "
                 f"{mdcode(cnt)}× \\| "
                 f"avg {mdcode(pct_str)} \\| "
                 f"total {mdcode(usd_str)}"
             )
+        if _hidden:
+            lines.append(mditalic(f"…and {_hidden} more reason type(s)"))
 
     lines += ["", mdbold(f"📂 Open Positions ({len(open_trades)}/{PAPER_MAX_CONCURRENT})")]
     if not open_trades:

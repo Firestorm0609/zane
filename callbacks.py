@@ -1,7 +1,7 @@
 """Inline button callbacks."""
 import logging
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import ContextTypes
 
@@ -28,7 +28,6 @@ PM = "MarkdownV2"
 
 def _paper_report_kb(page: int, total_pages: int) -> InlineKeyboardMarkup:
     """Navigation keyboard for the paginated paper report."""
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"paper_report_page_{page - 1}"))

@@ -5,3 +5,13 @@
 *.joblib
 __pycache__/
 *.pyc
+*.env
+*.db
+*.db-backup
+*.log
+*.joblib
+__pycache__/
+*.pyc
+wallet.json
+*.bak
+pump_monitor.log*

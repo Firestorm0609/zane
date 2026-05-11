@@ -192,7 +192,7 @@ def open_paper_trade(
     if raw_mc <= 0:
         return None
     entry_mc  = raw_mc * (1 + PAPER_SLIPPAGE_PCT / 100.0)
-    entry_fee = position_size_usd * (PAPER_FEE_PCT / 100.0)
+    entry_fee = 1.0  # flat $1 per side
     net_size  = position_size_usd - entry_fee
     name      = coin.get("name", "")
     symbol    = coin.get("symbol", "")
@@ -313,7 +313,7 @@ def close_trade(trade: OpenTrade, exit_mc: float, reason: str,
     pnl_pct = (((effective_exit - trade.entry_mc) / trade.entry_mc) * 100
                if trade.entry_mc > 0 else 0.0)
     gross_proceeds = trade.position_size_usd * (1 + pnl_pct / 100.0)
-    exit_fee       = gross_proceeds * (PAPER_FEE_PCT / 100.0)
+    exit_fee       = 1.0  # flat $1 per side
     net_proceeds   = max(0.0, gross_proceeds - exit_fee)
     pnl_usd        = net_proceeds - trade.position_size_usd
 

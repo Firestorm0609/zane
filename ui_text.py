@@ -636,7 +636,7 @@ def text_wallet() -> str:
         f"Total equity: {mdcode(fmt_usd(total, 2))}",
         f"Return: {pnl_e} {mdcode(fmt_pct(pnl_pct, 2, signed=True))}",
         "",
-        mditalic(f"Fees: {PAPER_FEE_PCT}% per side | Slippage: {PAPER_SLIPPAGE_PCT}%"),
+        mditalic(f"Fees: $1.00 per side | Slippage: {PAPER_SLIPPAGE_PCT}%"),
     ])
 
 

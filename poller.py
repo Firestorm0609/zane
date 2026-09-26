@@ -124,16 +124,21 @@ class Poller:
             # Browser relay covering this caller? Let it do the fetching — it
             # has an IP pump.fun trusts and we don't, and this VPS budget is
             # the scarce resource. Going quiet falls back to polling here.
+            # Covers both sources of pushed callouts: the browser relay and the
+            # NATS calloutCreated stream (pump_callouts.py). Both feed
+            # ingest_external, which stamps _relay_ts — so while push is
+            # delivering, the HTTP poll for this caller is redundant; the moment
+            # push goes quiet the stamp ages out and polling resumes by itself.
             relay_age = time.time() - self._relay_ts.get(caller_id, 0.0)
             if relay_age < RELAY_TRUST_S:
                 if caller_id not in self._relay_logged:
                     self._relay_logged.add(caller_id)
-                    log.info("poll %s: browser relay active (push %.0fs ago) — "
+                    log.info("poll %s: push relay active (%.0fs ago) — "
                              "skipping VPS poll", caller_id[:8], relay_age)
                 continue
             if caller_id in self._relay_logged:
                 self._relay_logged.discard(caller_id)
-                log.warning("poll %s: browser relay quiet for %.0fs — resuming "
+                log.warning("poll %s: push/relay quiet for %.0fs — resuming "
                             "VPS polling", caller_id[:8], relay_age)
             # A long gap (penalty pause, restart, freshly added caller) means
             # callouts happened while nobody was looking — fetch the deepest
@@ -288,8 +293,11 @@ class Poller:
         # pump.fun's: logged for every callout, so a bad one is never a mystery
         # (the 04:37 one could only be reasoned about after the fact).
         age_f = max(0.0, time.time() - (callout.get("createdAt", 0) or 0) / 1000)
-        log.info("callout %s detected — posted %.1fs ago (mint=%s)",
-                 cid[:12], age_f, mint[:12])
+        # `via` is the point of this line: push events land at ~0.05s and
+        # polled ones at ~11s, so one number says which path found it and
+        # whether the delay was ours or pump.fun's.
+        log.info("callout %s detected — posted %.1fs ago (mint=%s via=%s)",
+                 cid[:12], age_f, mint[:12], callout.get("source") or "http")
         age_s = int(age_f)
         if age_s > 1800:  # >30 min: too old to even mention
             # never drop silently — a blackout used to swallow these invisibly
@@ -502,11 +510,15 @@ class Poller:
 
     async def run(self, interval_s: float):
         # per-caller mode = 1 request per caller per cycle, each spaced by the
-        # shared pacing floor → the interval scales with the caller count so the
-        # request rate stays ~40/min (ceiling 60/min). Recomputed every cycle.
-        log.info("poller started (mode=%s, interval=%.1fs/caller%.1fs, feed=%.1fs)",
+        # pacing floor → the interval scales with the caller count so the
+        # request rate stays ~40/min per base (ceiling 60/min). Recomputed every
+        # cycle. With several bases the cycle shortens by that factor instead:
+        # each base keeps the same cadence, the bot just checks more often.
+        log.info("poller started (mode=%s, interval=%.1fs/caller%.1fs, feed=%.1fs, "
+                 "bases=%d)",
                  "feed" if config.FEED_MODE_ENABLED else "per-caller",
-                 interval_s, config.POLL_S_PER_CALLER, config.FEED_POLL_INTERVAL_S)
+                 interval_s, config.POLL_S_PER_CALLER, config.FEED_POLL_INTERVAL_S,
+                 len(config.PUMP_CALLOUT_BASES))
         while True:
             pause: Optional[float] = None
             try:
@@ -543,17 +555,28 @@ class Poller:
                 await asyncio.sleep(pause)
                 continue
             n_callers = max(1, getattr(self, "_last_caller_count", 1))
+            # Each base is a separate egress with its own allowance, and the
+            # rotation spreads one cycle's requests across them — so the bot may
+            # poll n_bases times as often while every base keeps the SAME
+            # cadence. POLL_INTERVAL_S and POLL_S_PER_CALLER describe ONE base.
+            # The count is the bases actually usable right now: a base serving a
+            # 429 penalty must NOT have its share absorbed by the others, or one
+            # ban would push them past the cadence that keeps them alive.
+            n_bases = max(1, len(self.client.healthy_bases()))
             if config.FEED_MODE_ENABLED and self.client.bot_uuid:
-                interval = config.FEED_POLL_INTERVAL_S
+                interval = config.FEED_POLL_INTERVAL_S / n_bases
             else:
-                interval = max(interval_s, config.POLL_S_PER_CALLER * n_callers)
+                interval = max(interval_s,
+                               config.POLL_S_PER_CALLER * n_callers) / n_bases
             if self._recover:
                 # ease back in instead of immediately re-filling the bucket
                 interval = max(interval, RECOVER_INTERVAL_S)
-            # The IP's own answer to "how fast may I poll?". Bursting the whole
-            # allowance and then sitting blind is worse than pacing to it: at a
-            # steady interval the alerts stay inside the 60s freshness window
-            # instead of arriving minutes late. 0.0 until a 429 teaches us.
+            # The egress's own answer to "how fast may I poll?", already divided
+            # across the bases (a base used once every N cycles only needs a
+            # cycle of L/N). Bursting the whole allowance and then sitting blind
+            # is worse than pacing to it: at a steady interval the alerts stay
+            # inside the 60s freshness window instead of arriving minutes late.
+            # 0.0 until a 429 teaches us.
             learned = self.client.sustainable_interval_s()
             if learned > interval:
                 if abs(learned - self._learned_logged) >= 1.0:

@@ -23,6 +23,8 @@ bot.pid
 caller_scan.json
 caller_scan.json.*
 dumped.txt
+# probe measurements (entry_probe.py / mirror_probe.py) — local data, not code
+*_probe.jsonl
 
 # ---- logs / caches ----
 bot.log

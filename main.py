@@ -17,6 +17,7 @@ from db import DB
 from exits import ExitEngine
 from handlers import Handlers
 from poller import Poller
+from pump_callouts import PumpCallouts
 
 logging.basicConfig(
     level=logging.INFO,
@@ -178,6 +179,19 @@ async def main():
     # /callouts on the ingest server, which feeds them into the poller
     pump_auth.callout_sink = poller.ingest_external
 
+    # realtime callout push: pump.fun's own app is instant because it SUBSCRIBES
+    # to calloutCreated.<mint>.<chainId> on the CORE NATS cluster — the HTTP
+    # endpoint publishes each callout ~10s late (p90 29s), which is what made an
+    # 18k call arrive as a 34k alert. Same anonymous credentials the site hands
+    # every visitor. Normalized into the /callout/list item shape and fed to the
+    # SAME ingest_external, so dedupe/cursor/fanout are shared with the poller.
+    background: list[asyncio.Task] = []   # cancelled on shutdown
+    push = None
+    if config.PUMP_PUSH_ENABLED:
+        push = PumpCallouts(db, sink=poller.ingest_external)
+        poller.push = push          # for status/log readouts
+        background.append(asyncio.create_task(push.run()))
+
     # feed mode: use the bot account (JWT) to follow all callers, then one
     # /callout/feed request covers them all — enables ~2s polling.
     # Auth = Privy token saved by pumpfarm --set-token / forwarded live by
@@ -196,18 +210,25 @@ async def main():
         pump_auth_task.cancel()
         poll_task.cancel()
         exits_task.cancel()
+        for t in background:
+            t.cancel()
         await client.close()
         log.info("shutdown complete")
 
     app.post_shutdown = on_shutdown
 
-    log.info("starting bot — detection=%s, polling callouts every %.1fs",
+    log.info("starting bot — detection=%s, polling callouts every %.1fs per base "
+             "across %d base(s)",
              "feed" if config.FEED_MODE_ENABLED else "per-caller",
-             config.POLL_INTERVAL_S)
+             config.POLL_INTERVAL_S, len(config.PUMP_CALLOUT_BASES))
     # rsplit drops any user:pass@ so credentials never reach the log
-    log.info("pump.fun egress: %s",
+    log.info("pump.fun egress: %s · bases: %s",
              config.PUMP_PROXY.rsplit("@", 1)[-1] if config.PUMP_PROXY
-             else "direct (PUMP_PROXY unset)")
+             else "direct (PUMP_PROXY unset)",
+             ", ".join(config.PUMP_CALLOUT_BASES))
+    log.info("callout push: %s",
+             f"enabled — SUB {config.PUMP_PUSH_SUBJECT} on the CORE cluster"
+             if push else "disabled (PUMP_PUSH_ENABLED=0)")
     await app.initialize()
 
     # start background trading/feed tasks only NOW: app.bot must be
@@ -215,6 +236,15 @@ async def main():
     # fire an alert seconds after starting)
     poll_task = asyncio.create_task(poller.run(config.POLL_INTERVAL_S))
     exits_task = asyncio.create_task(exits_engine.run())
+
+    async def push_heartbeat():
+        """One line every 10 min: is the push stream still alive and how fast."""
+        while True:
+            await asyncio.sleep(600)
+            log.info("callout push: %s", push.status())
+
+    if push:
+        background.append(asyncio.create_task(push_heartbeat()))
 
     # brand the bot + slash-command menu (skips no-ops and flood-control windows)
     await sync_telegram_branding(app.bot)

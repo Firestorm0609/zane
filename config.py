@@ -26,6 +26,21 @@ SUB_PRICE_STARS = int(os.environ.get("SUB_PRICE_STARS", "250"))
 # must not turn every URL into a relative path).
 PUMP_CALLOUT_BASE = (os.environ.get("PUMP_CALLOUT_BASE")
                      or "https://frontend-api-v3.pump.fun").strip().rstrip("/")
+# Extra egress bases to ROTATE pump.fun requests across (comma-separated, same
+# shape as PUMP_CALLOUT_BASE: a host that proxies /pump/* to the real API).
+# Why: the allowance is per SOURCE IP, so one egress is stuck at roughly one
+# request per 6s, while N independent egresses let the bot check N times as
+# often with every base still at that same cadence. Measured from this box: a
+# VPS IP and a phone IP both sit at ~13 req/600s, whereas a serverless edge
+# (Vercel, Cloudflare Workers, Deno Deploy) sustains 10 req/min — one allowance
+# per deployment, as long as their egress ranges differ. Verify a new base with
+# callout_mirror.js's /whoami route before trusting it as a separate pool.
+PUMP_CALLOUT_MIRRORS = [u.strip().rstrip("/") for u in
+                        os.environ.get("PUMP_CALLOUT_MIRRORS", "").split(",")
+                        if u.strip()]
+# Rotation order: the primary first, then the mirrors.
+PUMP_CALLOUT_BASES = [PUMP_CALLOUT_BASE] + [m for m in PUMP_CALLOUT_MIRRORS
+                                            if m != PUMP_CALLOUT_BASE]
 # Optional egress for pump.fun requests ONLY (http:// or https:// proxy URL,
 # with credentials inline if needed: http://user:pass@host:port).
 # Why: pump.fun throttles this host's IP to a couple of requests a minute, which
@@ -94,6 +109,20 @@ RT_MIN_TRADE_SOL = float(os.environ.get("RT_MIN_TRADE_SOL", "0.01"))
 RT_TRIGGER_COOLDOWN_S = float(os.environ.get("RT_TRIGGER_COOLDOWN_S", "3"))
 # How long a cached on-chain token balance is trusted by the realtime path.
 RT_TOKEN_TTL_S = float(os.environ.get("RT_TOKEN_TTL_S", "60"))
+
+# ---- real-time callout push (the app's own channel) ----
+# The HTTP endpoint publishes a callout ~10s after it was created (p90 ~29s) —
+# that delay is upstream and unfixable by polling faster. pump.fun's own app is
+# instant because it SUBSCRIBES on the CORE NATS cluster instead of polling:
+# calloutCreated.<mint>.<chainId> carries every callout platform-wide the moment
+# it is written, with the at-call mcap and run-up included. Measured created->us:
+# median 0.05s, worst 0.30s, and no HTTP requests at all — so it cannot 429.
+# Anonymous subscriber credentials are re-scraped from the site on every connect.
+PUMP_PUSH_ENABLED = os.environ.get("PUMP_PUSH_ENABLED", "1") not in ("0", "false", "False")
+# Blank = discover the CORE wss url + password from pump.fun's runtime config.
+PUMP_PUSH_NATS_URL = os.environ.get("PUMP_PUSH_NATS_URL", "").strip()
+PUMP_PUSH_NATS_PASS = os.environ.get("PUMP_PUSH_NATS_PASS", "").strip()
+PUMP_PUSH_SUBJECT = os.environ.get("PUMP_PUSH_SUBJECT", "calloutCreated.>").strip()
 
 # Detection mode. Feed mode (one /following-feed request covers every caller)
 # looked ideal, but that endpoint does NOT serve the newest callouts: it returns

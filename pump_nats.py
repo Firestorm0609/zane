@@ -159,9 +159,19 @@ class PumpNats:
                 await self._sync_subs(ws)
                 last_sync = time.time()
                 while True:
+                    # A busy stream never goes idle, so waiting for the 5s
+                    # timeout to pick up a new mint would delay the SUB (and
+                    # miss the first trades) exactly when a mint is hottest.
+                    # Poll briefly while a sync is pending, long when not.
+                    pending = self._wanted != set(self._subbed)
                     try:
-                        frame = _text(await asyncio.wait_for(ws.receive(), 5))
+                        frame = _text(await asyncio.wait_for(
+                            ws.receive(), 0.25 if pending else 5))
                     except asyncio.TimeoutError:
+                        if pending:
+                            await self._sync_subs(ws)
+                            last_sync = time.time()
+                            continue
                         # idle: keep the subscription set fresh and the link alive
                         if time.time() - last_sync >= 2.0:
                             await self._sync_subs(ws)

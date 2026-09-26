@@ -3,6 +3,7 @@ import asyncio
 import html
 import logging
 import time
+from collections import deque
 from typing import Any, Optional
 
 import aiohttp
@@ -16,9 +17,9 @@ log = logging.getLogger("callouts")
 # 1.2s => ~50 req/min, leaving headroom while keeping feed-mode detection fast.
 MIN_REQUEST_INTERVAL_S = 1.2
 
-# Headroom applied to the request rate learned from a 429 (see
-# CalloutClient._learn_rate_limit). 1.3 = aim for ~30% under the served limit so
-# we stop at the edge of the allowance instead of tripping it every window.
+# Headroom applied to the request rate learned from a 429 (see BaseState.learn).
+# 1.3 = aim for ~30% under the served limit so we stop at the edge of the
+# allowance instead of tripping it every window.
 RATE_SAFETY = 1.3
 
 # Deriving a rate needs a rate-sized sample. A 429 that arrives when barely any
@@ -39,6 +40,11 @@ RATE_LEARN_MIN_SAMPLE = 5
 RATE_DECAY_WINDOWS = 1
 RATE_DECAY_FACTOR = 0.85
 
+# How much request history the rolling rate meter keeps. Longer than any
+# Retry-After we accept (clamped to 900s), so the count inside a window is
+# never missing requests the server could still be counting.
+RATE_WINDOW_MAX_S = 1800.0
+
 # A 429 on this egress is usually ONE pooled IP refusing while the rest keep
 # serving. A 120-request probe at 3s ran at 92% success with the longest run of
 # failures being 2, while the same traffic independently taught the poller "85
@@ -51,6 +57,93 @@ RATE_DECAY_FACTOR = 0.85
 # down and learn.
 RATE_RETRY_ATTEMPTS = 2
 RATE_RETRY_DELAY_S = 1.5
+
+
+class BaseState:
+    """Rate state for ONE egress base — a pump.fun frontend we poll through.
+
+    The server's allowance is per source IP, so everything that answers "how
+    fast may I poll" lives here rather than on the client: the spacing floor,
+    the 429 cooldown, and the ceiling learned from a 429. One shared state is
+    what made a single base's ban stop every other base too.
+    """
+
+    __slots__ = ("url", "used", "last_req_ts", "cooldown_until", "req_ts",
+                 "sustainable_interval_s", "last_ban_ts", "last_window_s")
+
+    def __init__(self, url: str):
+        self.url = url
+        self.used = False                 # logged once, to prove rotation
+        self.last_req_ts: float = 0.0
+        self.cooldown_until: float = 0.0  # set when THIS base answers 429
+        # Rolling meter of dispatched requests. The learner divides the
+        # server's window by the requests spent INSIDE it, so the count must be
+        # trailing: counting since the last ban spanned a two-day clean run and
+        # derived a 0s interval, i.e. taught the poller nothing at all.
+        self.req_ts: deque[float] = deque()
+        self.sustainable_interval_s: float = 0.0
+        self.last_ban_ts: float = 0.0
+        self.last_window_s: float = 0.0
+
+    def cooldown_remaining(self) -> float:
+        return max(0.0, self.cooldown_until - time.monotonic())
+
+    def note_request(self) -> None:
+        """Record a request handed to this base (rolling-window rate meter)."""
+        now = time.monotonic()
+        self.req_ts.append(now)
+        cutoff = now - RATE_WINDOW_MAX_S
+        while self.req_ts and self.req_ts[0] < cutoff:
+            self.req_ts.popleft()
+
+    def spend_in_window(self, window_s: float) -> int:
+        """Requests dispatched to this base in the trailing `window_s` seconds."""
+        cutoff = time.monotonic() - window_s
+        while self.req_ts and self.req_ts[0] < cutoff:
+            self.req_ts.popleft()
+        return len(self.req_ts)
+
+    def learn(self, window_s: float) -> None:
+        """Derive this base's sustainable request interval from a 429.
+
+        The server hands us the window; the rolling meter says how many
+        requests we spent inside it. Bursting the allowance is what leaves the
+        bot blind for the next ten minutes, so the poller spreads them instead.
+
+        A window we barely entered is not evidence, so a sample smaller than
+        RATE_LEARN_MIN_SAMPLE is thrown away and the previous limit kept.
+        """
+        spent = self.spend_in_window(window_s)
+        if spent < RATE_LEARN_MIN_SAMPLE:
+            log.warning("%s: 429 after only %d request(s) in a %.0fs window — "
+                        "too small a sample to be a rate; keeping learned "
+                        "interval %.0fs", self.url, spent, window_s,
+                        self.sustainable_interval_s)
+            return
+        self.sustainable_interval_s = (window_s / spent) * RATE_SAFETY
+        self.last_window_s = window_s
+        self.last_ban_ts = time.monotonic()
+        log.warning("%s: learned rate limit — %d req spent in a trailing "
+                    "%.0fs window, sustainable interval %.0fs ±%.0f%%",
+                    self.url, spent, window_s, self.sustainable_interval_s,
+                    (RATE_SAFETY - 1) * 100)
+
+    def note_request_ok(self) -> None:
+        """Forget a learned limit as a clean streak lengthens (per base).
+
+        Without this a single bad patch would cap a base forever; the speedup
+        only has to be slow, not non-existent, so a genuinely clean base works
+        its way back to the configured interval on its own.
+        """
+        if not self.sustainable_interval_s or not self.last_ban_ts:
+            return
+        if (time.monotonic() - self.last_ban_ts
+                > self.last_window_s * RATE_DECAY_WINDOWS):
+            before = self.sustainable_interval_s
+            self.sustainable_interval_s *= RATE_DECAY_FACTOR
+            self.last_ban_ts = time.monotonic()  # next step another window out
+            log.info("%s: learned rate limit easing: %.0fs -> %.0fs (clean "
+                     "window)", self.url, before, self.sustainable_interval_s)
 
 
 class RateLimited(Exception):
@@ -91,7 +184,7 @@ def _proxy_for(url: str) -> Optional[str]:
     """
     if not config.PUMP_PROXY:
         return None
-    return config.PUMP_PROXY if config.PUMP_CALLOUT_BASE in url else None
+    return config.PUMP_PROXY if any(b in url for b in config.PUMP_CALLOUT_BASES) else None
 
 
 def is_solana_mint(mint: str) -> bool:
@@ -142,17 +235,11 @@ class CalloutClient:
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
         self._meta_cache: dict[str, dict[str, str]] = {}
-        self._last_req_ts: float = 0.0
-        self._req_lock = asyncio.Lock()
-        self._cooldown_until: float = 0.0  # set when we get a 429
-        # ---- learned rate limit ----
-        # A 429 tells us the window (Retry-After) and we know how many requests
-        # we spent inside it, so the rate this IP is actually allowed can be
-        # derived instead of guessed. The poller paces to it.
-        self._reqs_since_ban: int = 0
-        self._sustainable_interval_s: float = 0.0
-        self._last_ban_ts: float = 0.0
-        self._last_window_s: float = 0.0
+        self._req_lock = asyncio.Lock()  # serialises dispatch across all bases
+        # One rate state per egress base (see BaseState): the allowance is per
+        # source IP, so a 429 on one base must only take THAT base out.
+        self._bases = [BaseState(u) for u in config.PUMP_CALLOUT_BASES]
+        self._rr = 0                     # round-robin cursor over the bases
         self.bot_uuid: Optional[str] = None  # set by init_feed() when JWT is present
         self._uuid_cache: dict[str, str] = {}  # caller_id -> user uuid
         # live auth (PumpAuth instance or a static token string)
@@ -230,25 +317,46 @@ class CalloutClient:
 
     async def _paced_get(self, url: str, params: Optional[dict] = None,
                          _retried_auth: bool = False) -> tuple[int, Any]:
-        """Rate-limited GET: spaces requests, fails fast during a 429 cooldown.
+        """Rate-limited GET across every base.
+
+        A 429 is a penalty on ONE egress, so the request is served by the next
+        healthy base instead of the whole bot going blind. RateLimited escapes
+        only once every base is cooling down.
+        """
+        left = len(self._bases)
+        while True:
+            try:
+                return await self._get_once(url, params, _retried_auth)
+            except RateLimited:
+                if left <= 1 or not self.healthy_bases():
+                    raise
+                left -= 1
+                log.warning("a base is cooling down — serving this request "
+                            "from the next one")
+
+    async def _get_once(self, url: str, params: Optional[dict] = None,
+                        _retried_auth: bool = False) -> tuple[int, Any]:
+        """One HTTP GET, on the base that is next in rotation.
 
         On 401: forces a token refresh and retries ONCE (covers the hourly
         Firebase expiry and revoked-token cases).
         """
-        now = time.monotonic()
-        if now < self._cooldown_until:
-            raise RateLimited(self._cooldown_until - now)
+        if not self.healthy_bases():
+            raise RateLimited(self.cooldown_remaining())
         http = await self._http()
         await self._refresh_session_auth()
         async with self._req_lock:
-            # spacing between requests
-            elapsed = time.monotonic() - self._last_req_ts
+            base, url = self._pick_base(url)
+            if base.cooldown_until > time.monotonic():
+                raise RateLimited(base.cooldown_remaining())
+            # spacing between requests TO THIS BASE (the allowance is per IP)
+            elapsed = time.monotonic() - base.last_req_ts
             if elapsed < MIN_REQUEST_INTERVAL_S:
                 await asyncio.sleep(MIN_REQUEST_INTERVAL_S - elapsed)
             proxy = _proxy_for(url)
-            self._reqs_since_ban += 1  # this request spends part of the allowance
+            base.note_request()  # spends part of THIS base's allowance
             async with http.get(url, params=params, proxy=proxy) as resp:
-                self._last_req_ts = time.monotonic()
+                base.last_req_ts = time.monotonic()
                 if resp.status == 429:
                     # Don't believe a single 429 — see RATE_RETRY_ATTEMPTS. The
                     # sleep happens while _req_lock is held, deliberately: while
@@ -257,17 +365,17 @@ class CalloutClient:
                     retry_after = self._retry_after_of(resp)
                     for attempt in range(1, RATE_RETRY_ATTEMPTS + 1):
                         log.info("429 from %s — retrying in %.1fs (%d/%d) before "
-                                 "believing it", url, RATE_RETRY_DELAY_S,
+                                 "believing it", base.url, RATE_RETRY_DELAY_S,
                                  attempt, RATE_RETRY_ATTEMPTS)
                         await asyncio.sleep(RATE_RETRY_DELAY_S)
-                        self._reqs_since_ban += 1  # a retry is a request too
+                        base.note_request()  # a retry is a request too
                         async with http.get(url, params=params,
                                             proxy=proxy) as retry:
-                            self._last_req_ts = time.monotonic()
+                            base.last_req_ts = time.monotonic()
                             if retry.status == 200:
                                 # outlier confirmed: it teaches nothing and the
                                 # bot keeps its speed
-                                self._note_request_ok()
+                                base.note_request_ok()
                                 try:
                                     return 200, await retry.json()
                                 except Exception:
@@ -275,19 +383,19 @@ class CalloutClient:
                             if retry.status == 429:
                                 retry_after = self._retry_after_of(retry)
                     log.warning("429 from %s — cooling down %.0fs (retries did "
-                                "not clear it)", url, retry_after)
-                    self._cooldown_until = time.monotonic() + retry_after
-                    self._learn_rate_limit(retry_after)
+                                "not clear it)", base.url, retry_after)
+                    base.cooldown_until = time.monotonic() + retry_after
+                    base.learn(retry_after)
                     raise RateLimited(retry_after)
                 if resp.status == 401 and not _retried_auth:
                     log.info("401 from %s — forcing pump.fun token refresh + retry",
-                             url)
+                             base.url)
                     if self._pump_auth is not None:
                         await self._pump_auth.notify_401()
                     if await self._refresh_session_auth():
-                        # note: still holding _req_lock — _paced_get recursion
+                        # note: still holding _req_lock — _get_once recursion
                         # would deadlock, so do a single inline retry instead
-                        self._reqs_since_ban += 1  # the retry is a request too
+                        base.note_request()  # the retry is a request too
                         async with http.get(url, params=params,
                                             proxy=proxy) as retry_resp:
                             if retry_resp.status == 200:
@@ -297,7 +405,7 @@ class CalloutClient:
                                     return 200, None
                             return retry_resp.status, None
                 if resp.status == 200:
-                    self._note_request_ok()
+                    base.note_request_ok()
                     try:
                         return 200, await resp.json()
                     except Exception:
@@ -313,64 +421,57 @@ class CalloutClient:
             value = default
         return min(value, 900.0)
 
+    def healthy_bases(self) -> list[BaseState]:
+        """Bases that are not currently serving out a 429 penalty."""
+        now = time.monotonic()
+        return [b for b in self._bases if b.cooldown_until <= now]
+
+    def _pick_base(self, url: str) -> tuple[BaseState, str]:
+        """Next base in rotation, and this URL rewritten onto it.
+
+        Callers build URLs from config.PUMP_CALLOUT_BASE; the rotation swaps in
+        whichever base is due, so nothing else in the codebase has to know that
+        more than one exists.
+        """
+        bases = self.healthy_bases() or self._bases
+        base = bases[self._rr % len(bases)]
+        self._rr = (self._rr + 1) % max(1, len(bases))
+        if not base.used:
+            base.used = True
+            log.info("polling via base %s", base.url)
+        path = url
+        for known in config.PUMP_CALLOUT_BASES:
+            if url.startswith(known):
+                path = url[len(known):]
+                break
+        return base, base.url + path
+
     def sustainable_interval_s(self) -> float:
-        """Seconds between requests this IP has been observed to sustain.
+        """Cycle interval that keeps every base inside its learned ceiling.
 
-        0.0 = nothing learned yet, so the configured interval applies.
+        A base is hit once every N cycles (round-robin), so a base that learned
+        `L` seconds between requests only needs a cycle of `L / N` — the other
+        bases cover what would otherwise be idle waiting. 0.0 = nothing learned
+        yet, so the configured interval applies.
         """
-        return self._sustainable_interval_s
-
-    def _learn_rate_limit(self, window_s: float) -> None:
-        """Derive the sustainable request interval from a 429.
-
-        The server hands us the window; we know the requests we spent in it.
-        Bursting the whole allowance in two minutes is what left the bot blind
-        for the next ten, so the poller uses this to spread them out instead.
-
-        A window we barely entered is not evidence, so a sample smaller than
-        RATE_LEARN_MIN_SAMPLE is thrown away and the previous limit kept.
-        """
-        allowed = max(1, self._reqs_since_ban)
-        self._reqs_since_ban = 0
-        if allowed < RATE_LEARN_MIN_SAMPLE:
-            log.warning("429 after only %d request(s) in a %.0fs window — too "
-                        "small a sample to be a rate; keeping learned "
-                        "interval %.0fs",
-                        allowed, window_s, self._sustainable_interval_s)
-            return
-        self._sustainable_interval_s = (window_s / allowed) * RATE_SAFETY
-        self._last_window_s = window_s
-        self._last_ban_ts = time.monotonic()
-        log.warning("learned rate limit: %d req allowed per %.0fs window — "
-                    "sustainable interval %.0fs ±%.0f%%",
-                    allowed, window_s, self._sustainable_interval_s,
-                    (RATE_SAFETY - 1) * 100)
-
-    def _note_request_ok(self) -> None:
-        """Forget a learned limit as a clean streak lengthens.
-
-        Without this a single bad patch would cap the bot forever; the speedup
-        only has to be slow, not non-existent, so a genuinely clean egress
-        works its way back to the configured interval on its own.
-        """
-        if not self._sustainable_interval_s or not self._last_ban_ts:
-            return
-        if (time.monotonic() - self._last_ban_ts
-                > self._last_window_s * RATE_DECAY_WINDOWS):
-            before = self._sustainable_interval_s
-            self._sustainable_interval_s *= RATE_DECAY_FACTOR
-            self._last_ban_ts = time.monotonic()  # next step another window out
-            log.info("learned rate limit easing: %.0fs -> %.0fs (clean window)",
-                     before, self._sustainable_interval_s)
+        bases = self.healthy_bases() or self._bases
+        ceilings = [b.sustainable_interval_s for b in bases
+                    if b.sustainable_interval_s > 0]
+        if not ceilings:
+            return 0.0
+        return max(ceilings) / len(bases)
 
     def cooldown_remaining(self) -> float:
-        """Seconds left in the server-imposed 429 cooldown (0 when clear).
+        """Seconds until the FIRST base is usable again (0 when one already is).
 
-        The poller waits out the FULL penalty window with this: sleeping a
-        fixed shorter amount made it resume exactly on the Retry-After
-        boundary, which re-armed a fresh 600s ban every single cycle.
+        Only reached when every base is cooling down: retrying as soon as one
+        of them clears is what keeps the blind window short, and each base's
+        own penalty is re-checked on the request that follows. Waiting for the
+        LAST one instead was how a single 151s ban cost 10 minutes of polling.
         """
-        return max(0.0, self._cooldown_until - time.monotonic())
+        if not self._bases:
+            return 0.0
+        return min(b.cooldown_remaining() for b in self._bases)
 
     async def close(self):
         if self._session and not self._session.closed:
@@ -637,12 +738,17 @@ def format_callout(c: dict[str, Any], meta: Optional[dict[str, str]] = None) -> 
     created = c.get("createdAt", 0) / 1000
     age_s = max(0, int(time.time() - created))
     age = f"{age_s}s ago" if age_s < 3600 else f"{age_s // 60}m ago"
+    # Engagement is cosmetic and the realtime push payload doesn't carry it, so
+    # omit the counters when absent instead of printing a fake "❤️ 0 · 👁 0".
+    likes, views = c.get("likes"), c.get("viewCount")
+    engagement = (f" · ❤️ {likes or 0} · 👁 {views or 0}"
+                  if likes is not None or views is not None else "")
     evm = "" if is_solana_mint(mint) else " ⚠️ EVM (not tradable)"
     return (
         f"📣 <b>${symbol}</b> — {name}{evm}\n"
         f"• MC at call: <code>${mc:,.0f}</code>\n"
         f"• Best since: <b>{mult:.2f}x</b>\n"
-        f"• {age} · ❤️ {c.get('likes', 0)} · 👁 {c.get('viewCount', 0)}\n"        + (f"• <i>{thesis}</i>\n" if thesis else "")
+        f"• {age}{engagement}\n"        + (f"• <i>{thesis}</i>\n" if thesis else "")
         # Truncated on purpose. The dedicated SIGNAL message is the ONE place
         # a full, scrapable CA is emitted; an external exec bot (mirrorbot ->
         # basedbot) reads CAs out of messages, so a full mint here would fire a

@@ -48,6 +48,10 @@ CONNECT_TEMPLATE = (
 
 RECONNECT_MIN_S = 2.0
 RECONNECT_MAX_S = 60.0
+# How long the socket may sit silent before we send our own keepalive PING. The
+# read loop wakes every 0.25s regardless (see _session), so this is a timer, not
+# a wakeup interval.
+IDLE_PING_S = 15.0
 
 
 def _text(msg: Any) -> str:
@@ -157,26 +161,29 @@ class PumpNats:
                 log.info("nats connected (%s) — subscribed to %d held mint(s)",
                          self.url, len(self._wanted))
                 await self._sync_subs(ws)
-                last_sync = time.time()
+                last_ping = time.time()
                 while True:
-                    # A busy stream never goes idle, so waiting for the 5s
-                    # timeout to pick up a new mint would delay the SUB (and
-                    # miss the first trades) exactly when a mint is hottest.
-                    # Poll briefly while a sync is pending, long when not.
-                    pending = self._wanted != set(self._subbed)
+                    # Sync BEFORE parking the loop. _wanted is set by other
+                    # tasks (exits.py, entry_probe.py), and _sync_subs used to
+                    # be reachable only from the idle timeout below — a busy
+                    # stream never times out, so a new mint's SUB waited for the
+                    # first lull, which is backwards: the mint gets added
+                    # because it is hot. Checking every iteration takes frame
+                    # pacing out of it entirely.
+                    if self._wanted != set(self._subbed):
+                        await self._sync_subs(ws)
+                        continue
                     try:
-                        frame = _text(await asyncio.wait_for(
-                            ws.receive(), 0.25 if pending else 5))
+                        # Still a short wait: a fresh mint's own stream is empty
+                        # by definition, so nothing on this socket may wake us,
+                        # and set_wanted() can land at any moment. This bounds
+                        # that case to 0.25s; the check above bounds the busy
+                        # one to a single frame.
+                        frame = _text(await asyncio.wait_for(ws.receive(), 0.25))
                     except asyncio.TimeoutError:
-                        if pending:
-                            await self._sync_subs(ws)
-                            last_sync = time.time()
-                            continue
-                        # idle: keep the subscription set fresh and the link alive
-                        if time.time() - last_sync >= 2.0:
-                            await self._sync_subs(ws)
-                            last_sync = time.time()
-                        await ws.send_str("PING\r\n")
+                        if time.time() - last_ping >= IDLE_PING_S:
+                            await ws.send_str("PING\r\n")   # keepalive
+                            last_ping = time.time()
                         continue
                     if not frame:
                         continue

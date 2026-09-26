@@ -1,0 +1,47 @@
+# ---- secrets / credentials ----
+# Every .env variant. The .env.example template is safe and IS committed.
+.env
+.env.*
+!.env.example
+.pump-auth.json
+.pump-profile/
+.telegram-profile.json
+*.session
+treasury.json
+*.keypair.json
+*.keypair
+*.pem
+*.key
+
+# ---- runtime data / state ----
+bot.db
+bot.db.*
+*.db
+*.db.*
+bot.pid
+*.pid
+caller_scan.json
+caller_scan.json.*
+dumped.txt
+
+# ---- logs / caches ----
+bot.log
+*.log
+logs/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ---- large/derived local artifacts ----
+*.bak
+*.bak-*
+hunt_pool.json
+hunt_vetted.json
+streak_scan.json
+ev_scan.json
+
+# ---- unrelated project: the pump_lads / hoodstreet art + mint stack ----
+# Its own repo, huge (node_modules, build output, ~755MB hoodstreet-repo
+# clone). Not part of the callout bot; keep it out entirely.
+pump_lads/

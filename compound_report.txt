@@ -1,0 +1,101 @@
+=====================================================================
+ MEME DETECTIVE COMPOUNDING MODEL  --  10 DAYS
+=====================================================================
+
+ HEADLINE ANSWER
+ ---------------
+   +299,183%   (2992.8x)
+   0.2 SOL  ->  598.57 SOL  in 10 days
+
+---------------------------------------------------------------------
+ PARAMETERS (as requested)
+---------------------------------------------------------------------
+   start size ............ 0.2 SOL
+   return per callout .... 1.5x  (i.e. +50% gross on the stake)
+   callouts .............. 2 per day x 10 days = 20 trades
+   gas ................... 0.01 SOL per trade (20 trades = 0.20 SOL)
+   sizing ................ buy = 0.2 SOL + ALL profit accumulated so far
+                           (full profit reinvested every trade)
+
+ ASSUMPTIONS
+   - the 1.5x is GROSS (before gas); gas is deducted from proceeds
+   - gas is charged PER TRADE, not per day
+   - every single one of the 20 callouts hits exactly 1.5x (no misses,
+     no partial fills) -- see WARNING at the bottom
+   - no slippage, no fees beyond the 0.01 SOL, no failed txs
+   - profits are realised in full before the next callout
+
+---------------------------------------------------------------------
+ RESULT
+---------------------------------------------------------------------
+   initial capital ...............    0.2        SOL
+   final equity ..................  598.566211   SOL
+   total profit ..................  598.366211   SOL
+   gain ..........................  299,183.11%
+   multiple ......................  2992.83x
+   total gas paid ................    0.20       SOL
+
+---------------------------------------------------------------------
+ DAY BY DAY
+---------------------------------------------------------------------
+   day  1    equity     0.4250 SOL    gain       112.50%   (    2.125x)
+   day  2    equity     0.9313 SOL    gain       365.62%   (    4.656x)
+   day  3    equity     2.0703 SOL    gain       935.16%   (   10.352x)
+   day  4    equity     4.6332 SOL    gain      2216.60%   (   23.166x)
+   day  5    equity    10.3997 SOL    gain      5099.85%   (   51.999x)
+   day  6    equity    23.3743 SOL    gain     11587.17%   (  116.872x)
+   day  7    equity    52.5673 SOL    gain     26183.63%   (  262.836x)
+   day  8    equity   118.2514 SOL    gain     59025.68%   (  591.257x)
+   day  9    equity   266.0405 SOL    gain    132920.27%   ( 1330.203x)
+   day 10    equity   598.5662 SOL    gain    299183.11%   ( 2992.831x)
+
+---------------------------------------------------------------------
+ TRADE BY TRADE (first 3 / last 3)
+---------------------------------------------------------------------
+   trade  1   buy    0.2000   gross    0.3000   net    0.2900   equity    0.2900
+   trade  2   buy    0.2900   gross    0.4350   net    0.4250   equity    0.4250
+   trade  3   buy    0.4250   gross    0.6375   net    0.6275   equity    0.6275
+   ...
+   trade 18   buy  177.3670   gross  266.0505   net  266.0405   equity  266.0405
+   trade 19   buy  266.0405   gross  399.0608   net  399.0508   equity  399.0508
+   trade 20   buy  399.0508   gross  598.5762   net  598.5662   equity  598.5662
+
+---------------------------------------------------------------------
+ WHAT GAS COSTS YOU
+---------------------------------------------------------------------
+   without gas ....... 665.051346 SOL   = +332,425.67%
+   with gas (0.01/tx)   598.566211 SOL   = +299,183.11%
+   gas drag ..........  66.485135 SOL   = 33,242.57 percentage points
+
+   0.01 SOL looks trivial at 0.2 SOL size (5% of the stake) but it is
+   a 5% haircut on the 50% edge, and that 5% compounds 20 times. Over
+   10 days it destroys ~11% of the final equity (665 -> 599 SOL).
+
+---------------------------------------------------------------------
+ FOR CONTRAST: NO COMPOUNDING
+---------------------------------------------------------------------
+   flat 0.2 SOL every trade, same 20 trades:
+   final equity 2.0000 SOL = +900.00%
+   (compounding is worth ~332,000 extra percentage points)
+
+---------------------------------------------------------------------
+ WARNING -- READ THIS
+---------------------------------------------------------------------
+ 1. This is a PERFECT-STREAK model. It assumes 20/20 callouts return
+    exactly 1.5x. Any miss resets the maths hard: because you bet the
+    WHOLE pot every time, a single -100% (rug / zero) at trade 10 wipes
+    out everything. A single 0.5x at trade 15 erases most of the run.
+ 2. 1.5x on every callout is not supported by the data. Meme
+    Detective's measured 2x rate is 75.9% (n=133, Wilson LB 68.0%,
+    median 2.73x) -- and that 2x is the coin's PEAK after the call,
+    measured from call price, NOT an entry a follower can get. 61k
+    followers front-run it and the feed is detected ~13s late.
+ 3. Real capturable fill quality is unmeasured. Do not size a live
+    account against this number.
+ 4. 598 SOL of exit liquidity does not exist for these mints at
+    this position size. Slippage alone breaks the model long
+    before day 10.
+
+ This is an arithmetic ceiling, not a forecast.
+
+=====================================================================

@@ -1,0 +1,1 @@
+phone_all.sh
